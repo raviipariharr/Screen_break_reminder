@@ -1,28 +1,34 @@
 """
-Screen Break Reminder — Pomodoro + 20-20-20 Rule (Green Edition)
-------------------------------------------------------------------
-A friendly, green-themed desktop app that:
-  - Tracks how long you've been on the screen
-  - Runs Pomodoro work/break cycles
-  - Reminds you every 20 minutes to look 20 feet away for 20 seconds
-  - Warns you 30 seconds BEFORE a break starts, so you can wrap up
-  - Shows a big, full-green "look away" screen during the eye break,
-    with rotating suggestions of other things to do
-  - Plays sound alerts for warnings and breaks
+Screen Break Reminder — Full Edition
+=======================================
+Pomodoro + 20-20-20 screen break companion for Windows with:
+  1. Modern dashboard (progress ring, live stats, quick controls)
+  2. Dedicated 20-20-20 guided eye-break screen
+  3. Native Windows notifications with action buttons (optional)
+  4. System tray integration (optional)
+  5. Floating "break due" widget + optional full-screen break mode
+  6. A short break-activity library (Eyes / Body / Relax / Move)
+  7. A statistics page with simple charts and healthy-behavior framing
+  8. An optional daily wellbeing score
+  9. Presets (Classic / Deep Work / 20-20-20 / Custom) you can save
+ 10. A comprehensive settings page (Timer / 20-20-20 / Notifications /
+     Appearance / Behavior)
 
-Pure Python standard library only (tkinter) so it packages cleanly
-into a single .exe with PyInstaller. No internet, no external
-dependencies required.
+Standard library only for the core app; pystray + Pillow (tray icon)
+and windows-toasts (native toast buttons) are optional — everything
+still works without them, just with simpler in-app equivalents.
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox
 import json
 import os
 import sys
+import time
 import random
 import threading
-from datetime import date
+import queue
+import tkinter as tk
+from tkinter import ttk, messagebox, colorchooser
+from datetime import date, datetime, timedelta
 
 try:
     import winsound
@@ -30,28 +36,88 @@ try:
 except ImportError:
     HAS_WINSOUND = False
 
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    HAS_TRAY = True
+except ImportError:
+    HAS_TRAY = False
 
-# ---------------------------------------------------------------------------
-# Colors — green theme
-# ---------------------------------------------------------------------------
-COL_BG = "#eef7ee"          # app background, soft green-white
-COL_HEADER = "#2e7d32"      # deep green header bar
-COL_HEADER_TEXT = "#ffffff"
-COL_CARD = "#ffffff"        # card backgrounds
-COL_CARD_BORDER = "#c8e6c9"
-COL_PRIMARY = "#43a047"     # main green (buttons)
-COL_PRIMARY_DARK = "#2e7d32"
-COL_PRIMARY_LIGHT = "#e8f5e9"
-COL_TEXT = "#1b3a1e"
-COL_MUTED = "#5c6b5c"
-COL_WARN = "#fb8c00"        # pause / amber
-COL_DANGER = "#e53935"      # reset / red (used sparingly)
-COL_ACCENT = "#a5d6a7"
-COL_EYE_BG = "#2e7d32"      # big full-green eye-rest screen
+try:
+    from windows_toasts import (
+        InteractableWindowsToaster, Toast, ToastButton,
+        ToastActivatedEventArgs, ToastDuration,
+    )
+    HAS_NATIVE_TOAST = True
+except ImportError:
+    HAS_NATIVE_TOAST = False
 
 
 # ---------------------------------------------------------------------------
-# Config / persistence
+# Windows-only helpers (idle time, system theme, start-with-windows) —
+# all guarded so the file still runs/parses fine on any platform.
+# ---------------------------------------------------------------------------
+
+def get_idle_seconds():
+    """Seconds since the last keyboard/mouse input. Returns 0 if unknown
+    (non-Windows, or the check failed for any reason)."""
+    if sys.platform != "win32":
+        return 0
+    try:
+        import ctypes
+
+        class LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+        lii = LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
+        millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
+        return millis / 1000.0
+    except Exception:
+        return 0
+
+
+def get_system_theme():
+    if sys.platform != "win32":
+        return "light"
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                              r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        winreg.CloseKey(key)
+        return "light" if val else "dark"
+    except Exception:
+        return "light"
+
+
+def set_start_with_windows(enabled):
+    if sys.platform != "win32":
+        return
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                              r"Software\Microsoft\Windows\CurrentVersion\Run",
+                              0, winreg.KEY_SET_VALUE)
+        if enabled:
+            if getattr(sys, "frozen", False):
+                cmd = f'"{sys.executable}"'
+            else:
+                cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+            winreg.SetValueEx(key, "ScreenBreakReminder", 0, winreg.REG_SZ, cmd)
+        else:
+            try:
+                winreg.DeleteValue(key, "ScreenBreakReminder")
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Paths / persistence
 # ---------------------------------------------------------------------------
 
 def app_dir():
@@ -61,28 +127,76 @@ def app_dir():
 
 
 DATA_FILE = os.path.join(app_dir(), "screen_break_data.json")
+HISTORY_DAYS_KEPT = 30
 
 DEFAULTS = {
+    # Timer
     "work_minutes": 25,
     "short_break_minutes": 5,
     "long_break_minutes": 15,
     "cycles_before_long_break": 4,
-    "rule_interval_minutes": 20,   # 20-20-20: every 20 minutes
-    "rule_look_seconds": 20,       # look away for 20 seconds
+    "warning_seconds": 30,
+    "active_preset": "Classic",
+    # 20-20-20
+    "eye_rule_enabled": True,
+    "rule_interval_minutes": 20,
+    "rule_look_seconds": 20,
+    "eye_sound_enabled": True,
+    # Notifications
+    "notifications_enabled": True,
+    "notification_sound": True,
+    "snooze_minutes": 5,
     "sound_enabled": True,
-    "warning_seconds": 30,         # heads-up notice before a break starts
+    # Break style
+    "floating_widget_enabled": True,
+    "fullscreen_break_mode": False,
+    "widget_position": "bottom_right",
+    "activity_suggestions_enabled": True,
+    # Appearance
+    "theme": "light",              # light, dark, system
+    "accent_color": "#43a047",
+    # Behavior
+    "start_with_windows": False,
+    "minimize_to_tray": True,
+    "smart_breaks": False,
+    "strict_mode": False,          # False = Gentle, True = Strict
+    # Presets
+    "custom_presets": {},
 }
 
-EYE_TIPS = [
-    "Blink slowly 10 times to re-moisten your eyes.",
-    "Stretch your neck gently, side to side.",
-    "Roll your shoulders backward a few times.",
-    "Take a slow, deep breath in… and out.",
-    "Stand up and stretch your arms overhead.",
-    "Drink a few sips of water.",
-    "Relax your jaw and unclench your shoulders.",
-    "Look at a plant, the sky, or anything far away.",
-]
+ACTIVITY_LIBRARY = {
+    "EYES": [
+        "👁 20-20-20: look 20 feet away for 20 seconds",
+        "😌 Blink exercise: blink slowly 10 times",
+        "🔭 Look into the distance for 15 seconds",
+    ],
+    "BODY": [
+        "🧍 Neck stretch: gently tilt your head side to side",
+        "🤷 Shoulder rolls: roll your shoulders back 10 times",
+        "✋ Wrist stretch: extend your arms and stretch your wrists",
+    ],
+    "RELAX": [
+        "🌬 30-second breathing: slow in, slow out",
+        "🔲 Box breathing: 4 in, 4 hold, 4 out, 4 hold",
+        "🙆 Close your eyes for 20 seconds",
+    ],
+    "MOVE": [
+        "🧎 Stand up and stretch",
+        "🚶 Walk around for a minute",
+        "💧 Drink a glass of water",
+    ],
+}
+_NON_EYE_ACTIVITIES = (ACTIVITY_LIBRARY["BODY"] + ACTIVITY_LIBRARY["RELAX"]
+                        + ACTIVITY_LIBRARY["MOVE"])
+
+PRESETS = {
+    "Classic": dict(work_minutes=25, short_break_minutes=5, long_break_minutes=15,
+                     cycles_before_long_break=4, rule_interval_minutes=20, rule_look_seconds=20),
+    "Deep Work": dict(work_minutes=50, short_break_minutes=10, long_break_minutes=20,
+                       cycles_before_long_break=3, rule_interval_minutes=20, rule_look_seconds=20),
+    "20-20-20 Focus": dict(work_minutes=20, short_break_minutes=5, long_break_minutes=15,
+                            cycles_before_long_break=4, rule_interval_minutes=20, rule_look_seconds=20),
+}
 
 
 def load_data():
@@ -118,19 +232,29 @@ def fmt_mmss(total_seconds):
     return f"{m:02d}:{s:02d}"
 
 
-def play_chime(kind="break"):
-    """Background-thread sound so the UI never freezes.
-    kind='warning' -> a single soft, quick beep (heads-up)
-    kind='break'   -> a short cheerful ascending chime (break starting)
-    """
-    def _play():
+def pct(numerator, denominator, default=100):
+    if denominator <= 0:
+        return default
+    return round(100 * numerator / denominator)
+
+
+def play_chime(kind="break", enabled=True, emphasize=False):
+    """emphasize=True (Strict mode) plays the alert twice in a row for a
+    more noticeable, but still non-alarming, reminder."""
+    if not enabled:
+        return
+
+    def _play_once():
         if HAS_WINSOUND:
             try:
                 if kind == "warning":
                     winsound.Beep(740, 150)
+                elif kind == "confirm":
+                    winsound.Beep(880, 90)
+                    winsound.Beep(1174, 140)
                 else:
                     for freq in (587, 740, 880, 1174):
-                        winsound.Beep(freq, 140)
+                        winsound.Beep(freq, 130)
             except Exception:
                 try:
                     winsound.MessageBeep(winsound.MB_ICONASTERISK)
@@ -141,487 +265,1815 @@ def play_chime(kind="break"):
                 print("\a")
             except Exception:
                 pass
+
+    def _play():
+        _play_once()
+        if emphasize:
+            time.sleep(0.25)
+            _play_once()
     threading.Thread(target=_play, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
-# Main app
+# Colors
 # ---------------------------------------------------------------------------
 
-class ScreenBreakApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Screen Break Reminder 🌿")
-        self.root.geometry("460x660")
-        self.root.minsize(460, 660)
-        self.root.configure(bg=COL_BG)
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+THEMES = {
+    "light": dict(bg="#f4faf5", card="#ffffff", text="#1b2e1f", muted="#63756a",
+                  border="#dcece0", ring_track="#e7f1e9"),
+    "dark": dict(bg="#101a14", card="#17251c", text="#eaf5ec", muted="#9db8a8",
+                 border="#20362a", ring_track="#22392b"),
+}
 
-        stored = load_data()
-        self.settings = dict(DEFAULTS)
-        self.settings.update(stored.get("settings", {}))
+BASE_STATE_META = {
+    "idle":        dict(color="#607d8b", light="#eceff1", label="Idle",               emoji="⚪"),
+    "focus":       dict(color="#2e7d32", light="#e8f5e9", label="Focus",              emoji="🟢"),
+    "break_soon":  dict(color="#a6790a", light="#fdf3e0", label="Break Soon",         emoji="🟡"),
+    "short_break": dict(color="#1565c0", light="#e3f2fd", label="Short Break",        emoji="🔵"),
+    "long_break":  dict(color="#00695c", light="#e0f2f1", label="Long Break",         emoji="🌿"),
+    "eye_break":   dict(color="#6a3fb5", light="#ede7f6", label="20-20-20 Eye Break", emoji="👀"),
+}
 
-        today = str(date.today())
-        if stored.get("last_date") == today:
-            self.today_seconds = stored.get("today_seconds", 0)
-        else:
-            self.today_seconds = 0
 
-        self.state = "idle"          # idle | work | short_break | long_break
-        self.remaining = 0
-        self.phase_total = self.settings["work_minutes"] * 60
+def get_state_meta(settings):
+    """A copy of the state metadata with the Focus color swapped for the
+    user's chosen accent color."""
+    meta = {k: dict(v) for k, v in BASE_STATE_META.items()}
+    meta["focus"]["color"] = settings.get("accent_color", "#43a047")
+    return meta
+
+
+def resolve_theme(settings):
+    t = settings.get("theme", "light")
+    if t == "system":
+        return get_system_theme()
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Timer engine
+# ---------------------------------------------------------------------------
+
+class TimerEngine:
+    def __init__(self, settings, on_event):
+        self.settings = settings
+        self.on_event = on_event
+        self.eye_break_active = False
+        self.reset_all(persisted=None)
+
+    def reset_all(self, persisted=None):
+        self.state = "idle"
+        self.remaining = self.settings["work_minutes"] * 60
+        self.phase_total = self.remaining
+        self.running = False
         self.cycle_count = 0
-        self.pomodoro_running = False
-
         self.rule_elapsed = 0
-        self.tracking = False
-        self.popup_open = False
-
-        # flags so 30-sec warnings fire exactly once per phase
-        self.warned_pomodoro = False
+        self.warned_break = False
         self.warned_eye = False
+        self.eye_break_active = False
 
-        self._setup_styles()
+        p = persisted or {}
+        self.today_focus_seconds = p.get("today_focus_seconds", 0)
+        self.today_break_seconds = p.get("today_break_seconds", 0)
+        self.today_screen_seconds = p.get("today_screen_seconds", 0)
+        self.eye_completed = p.get("eye_completed", 0)
+        self.eye_skipped = p.get("eye_skipped", 0)
+        self.short_completed = p.get("short_completed", 0)
+        self.short_skipped = p.get("short_skipped", 0)
+        self.long_completed = p.get("long_completed", 0)
+        self.long_skipped = p.get("long_skipped", 0)
+        self.focus_skipped = p.get("focus_skipped", 0)
+
+    # -- controls ---------------------------------------------------------
+
+    def start(self):
+        if self.state == "idle":
+            self.state = "focus"
+            self.remaining = self.settings["work_minutes"] * 60
+            self.phase_total = self.remaining
+        self.running = True
+        self.on_event("changed")
+
+    def pause(self):
+        self.running = False
+        self.on_event("changed")
+
+    def resume(self):
+        if self.state != "idle":
+            self.running = True
+        self.on_event("changed")
+
+    def restart(self):
+        """Restart the current cycle from a fresh, running Focus session,
+        keeping today's stats intact."""
+        self.reset_all(persisted=self.stats_snapshot())
+        self.start()
+
+    def skip(self):
+        if self.state in ("focus", "short_break", "long_break"):
+            self._record_skip(self.state)
+            self._advance()
+        self.on_event("changed")
+
+    def snooze_eye(self, minutes):
+        self.rule_elapsed = max(0, self.settings["rule_interval_minutes"] * 60 - minutes * 60)
+        self.warned_eye = False
+        self.eye_break_active = False
+        self.on_event("changed")
+
+    def snooze_break(self, minutes):
+        self.remaining += minutes * 60
+        self.warned_break = False
+        self.on_event("changed")
+
+    def trigger_eye_break_now(self):
+        self.warned_eye = False
+        self.rule_elapsed = 0
+        self.eye_break_active = True
+        self.on_event("eye_break_due")
+
+    def finish_eye_break(self, completed=True):
+        self.eye_break_active = False
+        if completed:
+            self.eye_completed += 1
+        else:
+            self.eye_skipped += 1
+        self.on_event("changed")
+
+    # -- per-tick update ----------------------------------------------------
+
+    def tick(self, idle_seconds=0.0):
+        smart = self.settings.get("smart_breaks", False)
+        is_away = smart and idle_seconds >= 90  # treat >90s idle as "already away"
+
+        if self.running and not is_away:
+            self.today_screen_seconds += 1
+
+        if (self.running and not is_away and self.settings.get("eye_rule_enabled", True)
+                and not self.eye_break_active):
+            self.rule_elapsed += 1
+            warn = self.settings["warning_seconds"]
+            eye_total = self.settings["rule_interval_minutes"] * 60
+            remain_eye = eye_total - self.rule_elapsed
+            if not self.warned_eye and 0 < remain_eye <= warn:
+                self.warned_eye = True
+                self.on_event("eye_warning")
+            if self.rule_elapsed >= eye_total:
+                self.warned_eye = False
+                self.rule_elapsed = 0
+                self.eye_break_active = True
+                self.on_event("eye_break_due")
+
+        if self.running and not is_away and self.state in ("focus", "short_break", "long_break"):
+            if self.state == "focus":
+                self.today_focus_seconds += 1
+            else:
+                self.today_break_seconds += 1
+
+            warn = self.settings["warning_seconds"]
+            if self.state == "focus" and not self.warned_break and 0 < self.remaining <= warn:
+                self.warned_break = True
+                self.on_event("break_warning")
+
+            if self.remaining > 0:
+                self.remaining -= 1
+            else:
+                self._record_completion(self.state)
+                self._advance()
+
+        self.on_event("tick")
+
+    def _record_completion(self, state):
+        if state == "short_break":
+            self.short_completed += 1
+        elif state == "long_break":
+            self.long_completed += 1
+        # focus completions are tracked via cycle_count in _advance()
+
+    def _record_skip(self, state):
+        if state == "short_break":
+            self.short_skipped += 1
+        elif state == "long_break":
+            self.long_skipped += 1
+        elif state == "focus":
+            self.focus_skipped += 1
+
+    def _advance(self):
+        self.warned_break = False
+        if self.state == "focus":
+            self.cycle_count += 1
+            if self.cycle_count % self.settings["cycles_before_long_break"] == 0:
+                self.state = "long_break"
+                self.remaining = self.settings["long_break_minutes"] * 60
+            else:
+                self.state = "short_break"
+                self.remaining = self.settings["short_break_minutes"] * 60
+            self.phase_total = self.remaining
+            self.on_event("phase_changed", new_state=self.state)
+        else:
+            self.state = "focus"
+            self.remaining = self.settings["work_minutes"] * 60
+            self.phase_total = self.remaining
+            self.on_event("phase_changed", new_state=self.state)
+
+    def display_state(self):
+        if self.eye_break_active:
+            return "eye_break"
+        if self.state == "focus" and self.warned_break:
+            return "break_soon"
+        return self.state
+
+    def stats_snapshot(self):
+        return dict(
+            today_focus_seconds=self.today_focus_seconds,
+            today_break_seconds=self.today_break_seconds,
+            today_screen_seconds=self.today_screen_seconds,
+            eye_completed=self.eye_completed,
+            eye_skipped=self.eye_skipped,
+            short_completed=self.short_completed,
+            short_skipped=self.short_skipped,
+            long_completed=self.long_completed,
+            long_skipped=self.long_skipped,
+            focus_completed=self.cycle_count,
+            focus_skipped=self.focus_skipped,
+        )
+
+    def wellbeing(self):
+        s = self.stats_snapshot()
+        eye_pct = pct(s["eye_completed"], s["eye_completed"] + s["eye_skipped"])
+        short_pct = pct(s["short_completed"], s["short_completed"] + s["short_skipped"])
+        long_pct = pct(s["long_completed"], s["long_completed"] + s["long_skipped"])
+        focus_pct = pct(s["focus_completed"], s["focus_completed"] + s["focus_skipped"])
+        score = round((eye_pct + short_pct + long_pct + focus_pct) / 4)
+
+        if score >= 90:
+            label = "Excellent"
+        elif score >= 75:
+            label = "Great"
+        elif score >= 60:
+            label = "Good"
+        elif score >= 40:
+            label = "Fair"
+        else:
+            label = "Just getting started"
+
+        breakdown = [
+            ("👀", "Eye breaks", eye_pct),
+            ("🧘", "Short breaks", short_pct),
+            ("🌿", "Long breaks", long_pct),
+            ("⏱", "Focus sessions", focus_pct),
+        ]
+        lowest = min(breakdown, key=lambda x: x[2])
+        if score >= 90:
+            tip = "💡 You're doing great. Keep this rhythm going!"
+        elif lowest[2] < 70:
+            tip = f"💡 You're doing well. Try to keep up with your {lowest[1].lower()} a bit more consistently."
+        else:
+            tip = "💡 You're doing well. Try taking your next long break on time."
+
+        return dict(score=score, label=label, breakdown=breakdown, tip=tip)
+
+
+# ---------------------------------------------------------------------------
+# Native Windows notifications (with graceful fallback)
+# ---------------------------------------------------------------------------
+
+class NotificationManager:
+    def __init__(self, settings, action_queue):
+        self.settings = settings
+        self.action_queue = action_queue
+        self.toaster = None
+        if HAS_NATIVE_TOAST:
+            try:
+                self.toaster = InteractableWindowsToaster("Screen Break Reminder")
+            except Exception:
+                self.toaster = None
+
+    def _dispatch(self, action):
+        self.action_queue.put(action)
+
+    def notify(self, title, body, actions=None, emphasize=False):
+        if not self.settings.get("notifications_enabled", True):
+            return
+        actions = actions or []
+
+        if self.toaster is not None:
+            try:
+                toast = Toast([title, body])
+                try:
+                    toast.duration = ToastDuration.Long if emphasize else ToastDuration.Short
+                except Exception:
+                    pass
+                for label, key in actions:
+                    toast.AddAction(ToastButton(label, f"action={key}"))
+
+                def on_activated(args):
+                    arg = getattr(args, "arguments", "") or ""
+                    if arg.startswith("action="):
+                        self._dispatch(arg.split("=", 1)[1])
+
+                toast.on_activated = on_activated
+                self.toaster.show_toast(toast)
+                if self.settings.get("notification_sound", True):
+                    play_chime("break", True, emphasize=emphasize)
+                return
+            except Exception:
+                pass
+
+        self._dispatch(("__fallback_toast__", title, body, actions, emphasize))
+
+
+# ---------------------------------------------------------------------------
+# System tray
+# ---------------------------------------------------------------------------
+
+class TrayManager:
+    def __init__(self, engine, action_queue, settings):
+        self.engine = engine
+        self.action_queue = action_queue
+        self.settings = settings
+        self.icon = None
+        self._icon_cache = {}
+        if HAS_TRAY:
+            self._build()
+
+    def _make_image(self, color_hex):
+        if color_hex in self._icon_cache:
+            return self._icon_cache[color_hex]
+        size = 64
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.ellipse((4, 4, size - 4, size - 4), fill=color_hex)
+        self._icon_cache[color_hex] = img
+        return img
+
+    def _status_text(self, item=None):
+        meta = get_state_meta(self.settings)[self.engine.display_state()]
+        return f"{meta['emoji']} {meta['label']} — {fmt_mmss(self.engine.remaining)}"
+
+    def _pause_resume_text(self, item=None):
+        return "⏸  Pause" if self.engine.running else "▶  Resume"
+
+    def _q(self, action):
+        return lambda icon=None, item=None: self.action_queue.put(action)
+
+    def _build(self):
+        menu = pystray.Menu(
+            pystray.MenuItem(self._status_text, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(self._pause_resume_text, self._q("toggle_pause")),
+            pystray.MenuItem("⏭  Skip", self._q("skip")),
+            pystray.MenuItem("↺  Restart", self._q("restart")),
+            pystray.MenuItem("👀  Start 20-20-20 Now", self._q("start_eye_break")),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("🖥  Open Dashboard", self._q("open_dashboard"), default=True),
+            pystray.MenuItem("📊  Statistics", self._q("open_stats")),
+            pystray.MenuItem("⚙  Settings", self._q("open_settings")),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("✕  Exit", self._q("quit")),
+        )
+        self.icon = pystray.Icon("screen_break_reminder", self._make_image("#2e7d32"),
+                                  "Screen Break Reminder", menu)
+
+    def start(self):
+        if self.icon is not None:
+            threading.Thread(target=self.icon.run, daemon=True).start()
+
+    def refresh(self):
+        if self.icon is None:
+            return
+        meta = get_state_meta(self.settings)[self.engine.display_state()]
+        try:
+            self.icon.icon = self._make_image(meta["color"])
+            self.icon.title = self._status_text()
+        except Exception:
+            pass
+
+    def stop(self):
+        if self.icon is not None:
+            try:
+                self.icon.stop()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Progress ring
+# ---------------------------------------------------------------------------
+
+class ProgressRing(tk.Canvas):
+    def __init__(self, parent, size=220, thickness=14, theme="light", **kw):
+        bg = THEMES[theme]["card"]
+        super().__init__(parent, width=size, height=size, bg=bg,
+                          highlightthickness=0, **kw)
+        self.size = size
+        self.thickness = thickness
+        self.theme = theme
+        self.pad = thickness / 2 + 4
+        self.arc_id = None
+        self.track_id = self.create_oval(self.pad, self.pad, size - self.pad, size - self.pad,
+                                          outline=THEMES[theme]["ring_track"], width=thickness)
+
+    def set_theme(self, theme):
+        self.theme = theme
+        self.configure(bg=THEMES[theme]["card"])
+        self.itemconfig(self.track_id, outline=THEMES[theme]["ring_track"])
+
+    def set_progress(self, fraction, color):
+        fraction = max(0.0, min(1.0, fraction))
+        s, p = self.size, self.pad
+        extent = -360 * fraction
+        if self.arc_id:
+            self.delete(self.arc_id)
+            self.arc_id = None
+        if fraction > 0:
+            self.arc_id = self.create_arc(p, p, s - p, s - p, start=90, extent=extent,
+                                           style="arc", outline=color, width=self.thickness)
+
+
+# ---------------------------------------------------------------------------
+# Small bar-chart canvas (used on the Statistics page — no external
+# charting library needed)
+# ---------------------------------------------------------------------------
+
+class BarChart(tk.Canvas):
+    def __init__(self, parent, width=380, height=140, theme="light", **kw):
+        super().__init__(parent, width=width, height=height,
+                          bg=THEMES[theme]["card"], highlightthickness=0, **kw)
+        self.w = width
+        self.h = height
+        self.theme = theme
+
+    def draw(self, labels, values, color, unit=""):
+        self.delete("all")
+        if not values:
+            return
+        max_val = max(values) or 1
+        n = len(values)
+        margin = 24
+        chart_w = self.w - margin * 2
+        chart_h = self.h - 34
+        bar_w = chart_w / n * 0.55
+        gap = chart_w / n
+
+        for i, (label, val) in enumerate(zip(labels, values)):
+            x_center = margin + gap * i + gap / 2
+            bar_h = (val / max_val) * chart_h if max_val else 0
+            x0 = x_center - bar_w / 2
+            x1 = x_center + bar_w / 2
+            y1 = self.h - 24
+            y0 = y1 - bar_h
+            self.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
+            self.create_text(x_center, self.h - 10, text=label,
+                              fill=THEMES[self.theme]["muted"], font=("Segoe UI", 7))
+            if val > 0:
+                self.create_text(x_center, y0 - 8, text=f"{val:g}{unit}",
+                                  fill=THEMES[self.theme]["text"], font=("Segoe UI", 7, "bold"))
+
+
+# ---------------------------------------------------------------------------
+# RoundedCard — a genuinely rounded-corner container (tkinter has no
+# native rounded frame, so this draws one on a Canvas and hosts normal
+# widgets inside it). Used everywhere a "card" appears in the UI, in
+# service of a calmer, more native-feeling Windows design language.
+# ---------------------------------------------------------------------------
+
+class RoundedCard(tk.Frame):
+    def __init__(self, parent, bg, radius=14, pad=2):
+        outer_bg = parent.cget("bg") if "bg" in parent.keys() else "#f4faf5"
+        super().__init__(parent, bg=outer_bg)
+        self.outer_bg = outer_bg
+        self.bg_color = bg
+        self.radius = radius
+        self.pad = pad
+        self.canvas = tk.Canvas(self, bg=outer_bg, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.inner = tk.Frame(self.canvas, bg=bg)
+        self.inner_id = self.canvas.create_window(pad, pad, window=self.inner, anchor="nw")
+        self.canvas.bind("<Configure>", lambda e: self._redraw())
+
+    @staticmethod
+    def _points(x1, y1, x2, y2, r):
+        return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+                x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+
+    def _redraw(self):
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        if w < 4 or h < 4:
+            return
+        self.canvas.delete("bgrect")
+        pts = self._points(1, 1, w - 1, h - 1, self.radius)
+        rect = self.canvas.create_polygon(pts, smooth=True, fill=self.bg_color,
+                                           outline=self.bg_color, tags="bgrect")
+        self.canvas.tag_lower(rect)
+        self.canvas.itemconfig(self.inner_id, width=w - 2 * self.pad)
+
+    def set_colors(self, outer_bg, card_bg):
+        self.outer_bg = outer_bg
+        self.bg_color = card_bg
+        self.canvas.configure(bg=outer_bg)
+        self.inner.configure(bg=card_bg)
+        self._redraw()
+
+    def finalize(self):
+        """Call once after all content has been packed into .inner, so
+        the card's height matches its content."""
+        self.update_idletasks()
+        req_h = self.inner.winfo_reqheight()
+        self.canvas.configure(height=req_h + 2 * self.pad)
+        self._redraw()
+
+
+# ---------------------------------------------------------------------------
+# Main dashboard window
+# ---------------------------------------------------------------------------
+
+class Dashboard:
+    def __init__(self, root, engine, settings, action_queue, notifier, tray, history):
+        self.root = root
+        self.engine = engine
+        self.settings = settings
+        self.action_queue = action_queue
+        self.notifier = notifier
+        self.tray = tray
+        self.history = history  # dict: date-str -> stats snapshot
+
+        self.floating_widget = None
+        self.eye_window = None
+        self._last_date = str(date.today())
+
+        self.root.title("Screen Break Reminder")
+        self.root.geometry("500x780")
+        self.root.minsize(440, 640)
+        self.root.resizable(True, True)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_button)
+
+        self._build_style()
         self._build_ui()
-        self._refresh_labels()
-        self.root.after(1000, self._tick)
+        self._apply_theme()
+        self._refresh()
 
-    # -- Styles ---------------------------------------------------------------
+        self.root.after(1000, self._tick_loop)
+        self.root.after(200, self._poll_actions)
 
-    def _setup_styles(self):
+    # -- theming ------------------------------------------------------------
+
+    def theme_name(self):
+        return resolve_theme(self.settings)
+
+    def theme(self):
+        return THEMES[self.theme_name()]
+
+    def state_meta(self):
+        return get_state_meta(self.settings)
+
+    def _build_style(self):
+        self.style = ttk.Style()
+        try:
+            self.style.theme_use("clam")
+        except Exception:
+            pass
+
+    def _apply_theme(self):
+        t = self.theme()
+        accent = self.settings.get("accent_color", "#43a047")
+        self.root.configure(bg=t["bg"])
+        if hasattr(self, "outer_canvas"):
+            self.outer_canvas.configure(bg=t["bg"])
+        if hasattr(self, "body"):
+            self.body.configure(bg=t["bg"])
+        s = self.style
+        s.configure("TFrame", background=t["bg"])
+        s.configure("Card.TFrame", background=t["card"])
+        s.configure("TLabel", background=t["bg"], foreground=t["text"], font=("Segoe UI", 10))
+        s.configure("Card.TLabel", background=t["card"], foreground=t["text"], font=("Segoe UI", 10))
+        s.configure("Muted.TLabel", background=t["card"], foreground=t["muted"], font=("Segoe UI", 9))
+        s.configure("Title.TLabel", background=t["bg"], foreground=t["text"], font=("Segoe UI", 18, "bold"))
+        s.configure("Sub.TLabel", background=t["bg"], foreground=t["muted"], font=("Segoe UI", 9))
+        s.configure("StatNum.TLabel", background=t["card"], foreground=t["text"], font=("Segoe UI", 15, "bold"))
+        s.configure("StatLbl.TLabel", background=t["card"], foreground=t["muted"], font=("Segoe UI", 8))
+        s.configure("Primary.TButton", background=accent, foreground="white",
+                     font=("Segoe UI", 10, "bold"), padding=(14, 8), borderwidth=0)
+        s.map("Primary.TButton", background=[("active", accent)])
+        s.configure("Outline.TButton", background=t["card"], foreground=t["text"],
+                     font=("Segoe UI", 10, "bold"), padding=(14, 8), borderwidth=1)
+        s.map("Outline.TButton", background=[("active", t["border"])])
+
+        for widget_name in ("card1", "card2", "card3"):
+            w = getattr(self, widget_name, None)
+            if w is not None:
+                w.set_colors(t["bg"], t["card"])
+        if hasattr(self, "ring"):
+            self.ring.set_theme(self.theme_name())
+        if hasattr(self, "hero"):
+            self.hero.configure(bg=accent)
+            for child in self.hero.winfo_children():
+                child.configure(bg=accent)
+
+    def _card(self, parent, accent_strip=False):
+        """A genuinely rounded, softly elevated card — see RoundedCard."""
+        card = RoundedCard(parent, bg=self.theme()["card"], radius=16, pad=2)
+        card.pack(fill="x", padx=20, pady=(0, 16))
+        strip = None
+        if accent_strip:
+            strip = tk.Frame(card.inner, bg=self.settings.get("accent_color", "#43a047"), height=4)
+            strip.pack(fill="x", side="top")
+        inner = ttk.Frame(card.inner, style="Card.TFrame")
+        inner.pack(fill="both", expand=True)
+        return card, inner, strip
+
+    # -- UI ----------------------------------------------------------------
+
+    def _build_scroll_container(self):
+        """Wraps the dashboard content in a scrollable area so it degrades
+        gracefully if the window is resized smaller than its content,
+        instead of clipping (part of a responsive layout)."""
+        t = self.theme()
+        self.outer_canvas = tk.Canvas(self.root, bg=t["bg"], highlightthickness=0)
+        vsb = ttk.Scrollbar(self.root, orient="vertical", command=self.outer_canvas.yview)
+        self.outer_canvas.configure(yscrollcommand=vsb.set)
+        self.outer_canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self.body = tk.Frame(self.outer_canvas, bg=t["bg"])
+        self._body_window = self.outer_canvas.create_window((0, 0), window=self.body, anchor="nw")
+
+        self.body.bind("<Configure>", lambda e: self.outer_canvas.configure(
+            scrollregion=self.outer_canvas.bbox("all")))
+        self.outer_canvas.bind("<Configure>", lambda e: self.outer_canvas.itemconfig(
+            self._body_window, width=e.width))
+
+        def _on_wheel(event):
+            delta = -1 if event.delta > 0 else 1
+            self.outer_canvas.yview_scroll(delta, "units")
+        # Only capture the mouse wheel while the cursor is actually over
+        # this canvas, so it doesn't hijack scrolling in other windows
+        # (Settings, Statistics) that happen to be open at the same time.
+        self.outer_canvas.bind("<Enter>", lambda e: self.outer_canvas.bind_all("<MouseWheel>", _on_wheel))
+        self.outer_canvas.bind("<Leave>", lambda e: self.outer_canvas.unbind_all("<MouseWheel>"))
+
+    def _build_ui(self):
+        self._build_scroll_container()
+        accent = self.settings.get("accent_color", "#43a047")
+        self.hero = tk.Frame(self.body, bg=accent)
+        self.hero.pack(fill="x")
+        tk.Label(self.hero, text="🌿  Screen Break Reminder", bg=accent, fg="white",
+                 font=("Segoe UI", 19, "bold")).pack(anchor="w", padx=24, pady=(22, 2))
+        tk.Label(self.hero, text="Calm, focused work — with breaks that actually happen.",
+                 bg=accent, fg="#ffffff", font=("Segoe UI", 9)).pack(anchor="w", padx=24, pady=(0, 20))
+
+        self.card1, timer_card, self.timer_strip = self._card(self.body, accent_strip=True)
+        self.state_badge = tk.Label(timer_card, text="Idle", font=("Segoe UI", 12, "bold"))
+        self.state_badge.pack(pady=(22, 8))
+
+        ring_wrap = ttk.Frame(timer_card, style="Card.TFrame")
+        ring_wrap.pack(pady=4)
+        self.ring = ProgressRing(ring_wrap, size=230, thickness=15, theme=self.theme_name())
+        self.ring.pack()
+        self.ring_time_label = tk.Label(ring_wrap, text="25:00", font=("Segoe UI", 32, "bold"))
+        self.ring_time_label.place(relx=0.5, rely=0.42, anchor="center")
+        self.ring_state_label = tk.Label(ring_wrap, text="", font=("Segoe UI", 10))
+        self.ring_state_label.place(relx=0.5, rely=0.58, anchor="center")
+
+        self.lbl_next_eye = ttk.Label(timer_card, text="Next eye break in: 20:00", style="Card.TLabel")
+        self.lbl_next_eye.pack(pady=(10, 4))
+        self.lbl_cycles = ttk.Label(timer_card, text="Focus sessions completed: 0", style="Card.TLabel")
+        self.lbl_cycles.pack(pady=(0, 12))
+
+        btn_row = ttk.Frame(timer_card, style="Card.TFrame")
+        btn_row.pack(pady=(0, 18))
+        self.btn_pause_resume = ttk.Button(btn_row, text="▶  Start", style="Primary.TButton",
+                                            command=lambda: self.action_queue.put("toggle_pause"))
+        self.btn_pause_resume.grid(row=0, column=0, padx=4)
+        self.btn_skip = ttk.Button(btn_row, text="⏭  Skip", style="Outline.TButton",
+                                    command=lambda: self.action_queue.put("skip"))
+        self.btn_skip.grid(row=0, column=1, padx=4)
+        self.btn_restart = ttk.Button(btn_row, text="↺  Restart", style="Outline.TButton",
+                                       command=lambda: self.action_queue.put("restart"))
+        self.btn_restart.grid(row=0, column=2, padx=4)
+        self.card1.finalize()
+
+        # Stats card (today snapshot + link to full statistics page)
+        self.card2, stats_card, _ = self._card(self.body)
+        head = ttk.Frame(stats_card, style="Card.TFrame")
+        head.pack(fill="x", padx=14, pady=(12, 6))
+        ttk.Label(head, text="Today's statistics", style="Card.TLabel",
+                  font=("Segoe UI", 11, "bold")).pack(side="left")
+        ttk.Button(head, text="📊 Full stats", style="Outline.TButton",
+                   command=self._open_stats).pack(side="right")
+
+        grid = ttk.Frame(stats_card, style="Card.TFrame")
+        grid.pack(fill="x", padx=14, pady=(0, 14))
+        self.stat_labels = {}
+        for i, (key, label) in enumerate([("screen", "Screen time"), ("focus", "Focus time"),
+                                           ("breaks", "Break time"), ("eye", "Eye breaks")]):
+            col = ttk.Frame(grid, style="Card.TFrame")
+            col.grid(row=0, column=i, padx=6, sticky="w")
+            num = ttk.Label(col, text="—", style="StatNum.TLabel")
+            num.pack(anchor="w")
+            ttk.Label(col, text=label, style="StatLbl.TLabel").pack(anchor="w")
+            self.stat_labels[key] = num
+        self.card2.finalize()
+
+        # Quick settings card
+        self.card3, quick_card, _ = self._card(self.body)
+        ttk.Label(quick_card, text="Quick settings", style="Card.TLabel",
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=14, pady=(12, 6))
+        qc = ttk.Frame(quick_card, style="Card.TFrame")
+        qc.pack(fill="x", padx=14, pady=(0, 14))
+
+        self.eye_enabled_var = tk.BooleanVar(value=self.settings.get("eye_rule_enabled", True))
+        ttk.Checkbutton(qc, text="👀 20-20-20 reminders", variable=self.eye_enabled_var,
+                         command=lambda: self._quick_set("eye_rule_enabled", self.eye_enabled_var)
+                         ).grid(row=0, column=0, sticky="w", pady=3)
+
+        self.notif_enabled_var = tk.BooleanVar(value=self.settings.get("notifications_enabled", True))
+        ttk.Checkbutton(qc, text="🔔 Notifications", variable=self.notif_enabled_var,
+                         command=lambda: self._quick_set("notifications_enabled", self.notif_enabled_var)
+                         ).grid(row=1, column=0, sticky="w", pady=3)
+
+        self.sound_var = tk.BooleanVar(value=self.settings.get("sound_enabled", True))
+        ttk.Checkbutton(qc, text="🔊 Sound", variable=self.sound_var,
+                         command=lambda: self._quick_set("sound_enabled", self.sound_var)
+                         ).grid(row=0, column=1, sticky="w", padx=(20, 0), pady=3)
+
+        self.dark_var = tk.BooleanVar(value=self.settings.get("theme", "light") == "dark")
+        ttk.Checkbutton(qc, text="🌙 Dark theme", variable=self.dark_var,
+                         command=self._on_theme_toggle).grid(row=1, column=1, sticky="w", padx=(20, 0), pady=3)
+        self.card3.finalize()
+
+        bottom = ttk.Frame(self.body)
+        bottom.pack(fill="x", padx=20, pady=(6, 18))
+        ttk.Button(bottom, text="⚙  All Settings", style="Outline.TButton",
+                   command=self._open_full_settings).pack(side="left")
+        hint = "Closing this window minimizes to tray." if HAS_TRAY else \
+               "(tray icon needs: pip install pystray pillow)"
+        ttk.Label(bottom, text=hint, style="Sub.TLabel").pack(side="right")
+
+    # -- toggle handlers ------------------------------------------------------
+
+    def _quick_set(self, key, var):
+        self.settings[key] = var.get()
+        self._persist()
+
+    def _on_theme_toggle(self):
+        self.settings["theme"] = "dark" if self.dark_var.get() else "light"
+        self._apply_theme()
+        self._persist()
+
+    def _open_full_settings(self):
+        SettingsWindow(self.root, self.settings, self.theme(), self.engine, on_save=self._on_settings_saved)
+
+    def _open_stats(self):
+        StatisticsWindow(self.root, self.engine, self.history, self.theme(), self.theme_name())
+
+    def _on_settings_saved(self):
+        self._apply_theme()
+        self._persist()
+        self._refresh()
+
+    # -- close / tray ---------------------------------------------------------
+
+    def _on_close_button(self):
+        if HAS_TRAY and self.tray.icon is not None and self.settings.get("minimize_to_tray", True):
+            self.root.withdraw()
+        else:
+            self.action_queue.put("quit")
+
+    def show(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.after(150, lambda: self.root.attributes("-topmost", False))
+
+    # -- action queue polling -----------------------------------------------
+
+    def _poll_actions(self):
+        try:
+            while True:
+                action = self.action_queue.get_nowait()
+                self._handle_action(action)
+        except queue.Empty:
+            pass
+        self.root.after(200, self._poll_actions)
+
+    def _handle_action(self, action):
+        if isinstance(action, tuple) and action and action[0] == "__fallback_toast__":
+            _, title, body, actions, emphasize = action
+            CornerToast(self.root, title, body, actions, self.action_queue, self.theme(),
+                        self.settings, emphasize=emphasize)
+            return
+
+        if action == "toggle_pause":
+            if self.engine.state == "idle":
+                self.engine.start()
+            elif self.engine.running:
+                self.engine.pause()
+            else:
+                self.engine.resume()
+        elif action == "skip":
+            self.engine.skip()
+        elif action == "restart":
+            self.engine.restart()
+        elif action == "start_eye_break":
+            self.engine.trigger_eye_break_now()
+        elif action in ("start_eye_break_go",):
+            self.show()
+        elif action == "open_dashboard":
+            self.show()
+        elif action == "open_stats":
+            self.show()
+            self._open_stats()
+        elif action == "open_settings":
+            self.show()
+            self._open_full_settings()
+        elif action == "start_break_now":
+            self.show()
+        elif action == "snooze_eye":
+            self.engine.snooze_eye(self.settings.get("snooze_minutes", 5))
+        elif action == "snooze_break":
+            self.engine.snooze_break(self.settings.get("snooze_minutes", 5))
+        elif action == "skip_break":
+            self.engine.skip()
+        elif action == "skip_eye":
+            self.engine.finish_eye_break(completed=False)
+        elif action == "quit":
+            self._quit()
+        self._refresh()
+
+    def _quit(self):
+        self._archive_today()
+        self._persist()
+        if self.tray.icon is not None:
+            self.tray.stop()
+        self.root.after(50, self.root.destroy)
+
+    # -- daily rollover / history ---------------------------------------------
+
+    def _archive_today(self):
+        self.history[self._last_date] = self.engine.stats_snapshot()
+        # keep only the most recent N days
+        if len(self.history) > HISTORY_DAYS_KEPT:
+            for k in sorted(self.history.keys())[:-HISTORY_DAYS_KEPT]:
+                del self.history[k]
+
+    def _tick_loop(self):
+        today = str(date.today())
+        if today != self._last_date:
+            self._archive_today()
+            self.engine.today_focus_seconds = 0
+            self.engine.today_break_seconds = 0
+            self.engine.today_screen_seconds = 0
+            self.engine.eye_completed = 0
+            self.engine.eye_skipped = 0
+            self.engine.short_completed = 0
+            self.engine.short_skipped = 0
+            self.engine.long_completed = 0
+            self.engine.long_skipped = 0
+            self.engine.focus_skipped = 0
+            self.engine.cycle_count = 0
+            self._last_date = today
+
+        idle = get_idle_seconds() if self.settings.get("smart_breaks", False) else 0.0
+        self.engine.tick(idle_seconds=idle)
+        self._refresh()
+        self._persist()
+        self.root.after(1000, self._tick_loop)
+
+    # -- engine event hook ------------------------------------------------------
+
+    def on_engine_event(self, event, **kwargs):
+        strict = self.settings.get("strict_mode", False)
+
+        if event == "break_warning":
+            secs = self.settings["warning_seconds"]
+            # Gentle: snooze + skip. Strict: skip only (no postponing, but
+            # never no way out at all).
+            actions = [("Skip to break", "skip_break")] if strict else \
+                      [("Snooze", "snooze_break"), ("Skip to break", "skip_break")]
+            self._toast_or_fallback("⏳ Break coming up",
+                                     f"Your break starts in {secs} seconds — wrap up what you're doing.",
+                                     actions, emphasize=strict)
+        elif event == "eye_warning":
+            secs = self.settings["warning_seconds"]
+            actions = [("Start now", "start_eye_break")] if strict else \
+                      [("Start now", "start_eye_break"), ("Snooze", "snooze_eye")]
+            self._toast_or_fallback("👀 Eye break coming up",
+                                     f"Time to look away in {secs} seconds — get ready.", actions,
+                                     emphasize=strict)
+        elif event == "eye_break_due":
+            play_chime("break", self.settings.get("eye_sound_enabled", True), emphasize=strict)
+            actions = [("Start Break", "start_eye_break_go"), ("Skip", "skip_eye")] if strict else \
+                      [("Start Break", "start_eye_break_go"), ("Snooze", "snooze_eye"), ("Skip", "skip_eye")]
+            self.notifier.notify("👀 Time for an eye break",
+                                  "You've been looking at your screen for a while.\n"
+                                  "Look 20 feet away for 20 seconds.", actions=actions, emphasize=strict)
+            self._open_eye_break_window()
+        elif event == "phase_changed":
+            new_state = kwargs.get("new_state")
+            play_chime("break", self.settings.get("sound_enabled", True), emphasize=strict)
+            # Skip is always offered — Strict mode is about discouraging
+            # postponement, never about removing the user's way out.
+            actions = [("Start Break", "start_break_now"), ("Skip", "skip_break")]
+            if new_state == "long_break":
+                self.notifier.notify("🌿 Long Break Time",
+                                      f"You've completed {self.engine.cycle_count} focus sessions.\n"
+                                      "Step away from your screen and recharge.", actions=actions,
+                                      emphasize=strict)
+            elif new_state == "short_break":
+                self.notifier.notify("🔵 Short Break Time",
+                                      "Nice work! Take a short break before the next focus session.",
+                                      actions=actions, emphasize=strict)
+            else:
+                self.notifier.notify("🟢 Back to Focus",
+                                      f"Break's over — {self.settings['work_minutes']} minutes of focus time.")
+            if new_state in ("short_break", "long_break"):
+                self._show_break_widget(new_state)
+
+    def _toast_or_fallback(self, title, body, actions, emphasize=False):
+        if self.settings.get("notifications_enabled", True):
+            self.notifier.notify(title, body, actions=actions, emphasize=emphasize)
+        else:
+            CornerToast(self.root, title, body, actions, self.action_queue, self.theme(),
+                        self.settings, emphasize=emphasize)
+
+    # -- floating widget / fullscreen break -----------------------------------
+
+    def _show_break_widget(self, state):
+        if self.settings.get("fullscreen_break_mode", False):
+            FullscreenBreak(self.root, self.engine, state, self.settings, self.action_queue, self.state_meta())
+            return
+        if not self.settings.get("floating_widget_enabled", True):
+            return
+        if self.floating_widget is not None:
+            try:
+                self.floating_widget.destroy_widget()
+            except Exception:
+                pass
+        self.floating_widget = FloatingWidget(self.root, self.engine, state, self.settings,
+                                               self.action_queue, self.theme(), self.state_meta())
+
+    def _open_eye_break_window(self):
+        if self.eye_window is not None:
+            try:
+                self.eye_window.destroy()
+            except Exception:
+                pass
+        self.eye_window = EyeBreakWindow(self.root, self.settings, on_finish=self._on_eye_finish)
+
+    def _on_eye_finish(self, completed=True):
+        self.engine.finish_eye_break(completed=completed)
+        self.eye_window = None
+        self._refresh()
+
+    # -- rendering --------------------------------------------------------------
+
+    def _refresh(self):
+        t = self.theme()
+        meta_all = self.state_meta()
+        disp = self.engine.display_state()
+        meta = meta_all[disp]
+
+        self.state_badge.config(text=f"{meta['emoji']}  {meta['label']}",
+                                 bg=meta["light"], fg=meta["color"], padx=14, pady=6,
+                                 font=("Segoe UI", 12, "bold"))
+        if getattr(self, "timer_strip", None) is not None:
+            self.timer_strip.configure(bg=meta["color"])
+        self.ring_time_label.config(text=fmt_mmss(self.engine.remaining), bg=t["card"], fg=t["text"])
+        self.ring_state_label.config(text=meta["label"], bg=t["card"], fg=meta["color"])
+
+        if self.engine.phase_total > 0:
+            frac = max(0.0, min(1.0, (self.engine.phase_total - self.engine.remaining) / self.engine.phase_total))
+        else:
+            frac = 0.0
+        self.ring.set_progress(frac, meta["color"])
+
+        eye_total = self.settings["rule_interval_minutes"] * 60
+        eye_remaining = eye_total - self.engine.rule_elapsed
+        eye_suffix = "" if self.settings.get("eye_rule_enabled", True) else " (disabled)"
+        self.lbl_next_eye.config(text=f"Next eye break in: {fmt_mmss(eye_remaining)}{eye_suffix}")
+        self.lbl_cycles.config(text=f"Focus sessions completed: {self.engine.cycle_count}")
+
+        self.btn_pause_resume.config(
+            text=("⏸  Pause" if self.engine.running else
+                  ("▶  Resume" if self.engine.state != "idle" else "▶  Start")))
+
+        self.stat_labels["screen"].config(text=fmt_hms(self.engine.today_screen_seconds))
+        self.stat_labels["focus"].config(text=fmt_hms(self.engine.today_focus_seconds))
+        self.stat_labels["breaks"].config(text=fmt_hms(self.engine.today_break_seconds))
+        self.stat_labels["eye"].config(text=str(self.engine.eye_completed))
+
+        self.tray.refresh()
+
+    def _persist(self):
+        save_data({
+            "settings": self.settings,
+            "last_date": self._last_date,
+            "stats": self.engine.stats_snapshot(),
+            "history": self.history,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Corner toast fallback
+# ---------------------------------------------------------------------------
+
+class CornerToast:
+    def __init__(self, root, title, body, actions, action_queue, theme, settings, emphasize=False):
+        self.win = tk.Toplevel(root)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        try:
+            self.win.attributes("-alpha", 0.0)
+        except Exception:
+            pass
+        self.win.configure(bg=theme["card"])
+
+        accent = settings.get("accent_color", "#43a047")
+        # Gentle: small, quiet, brief. Strict: a little larger, bolder
+        # border, stays up longer — still just a corner toast, never
+        # blocking the screen.
+        w, h = (340, 150) if emphasize else (320, 130)
+        title_size = 11 if emphasize else 10
+        stay_ms = 12000 if emphasize else 8000
+
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        x, y = sw - w - 24, sh - h - 60
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
+
+        tk.Frame(self.win, bg=accent, height=6 if emphasize else 4).pack(fill="x", side="top")
+        tk.Label(self.win, text=title, bg=theme["card"], fg=theme["text"],
+                 font=("Segoe UI", title_size, "bold"), anchor="w", justify="left",
+                 wraplength=w - 30).pack(fill="x", padx=14, pady=(10, 2))
+        tk.Label(self.win, text=body, bg=theme["card"], fg=theme["muted"],
+                 font=("Segoe UI", 9), anchor="w", justify="left",
+                 wraplength=w - 30).pack(fill="x", padx=14)
+
+        if actions:
+            btn_row = tk.Frame(self.win, bg=theme["card"])
+            btn_row.pack(fill="x", padx=10, pady=8)
+            for label, key in actions[:2]:
+                tk.Button(btn_row, text=label, font=("Segoe UI", 8, "bold"),
+                          bg=accent, fg="white", relief="flat", padx=8, pady=3,
+                          command=lambda k=key: self._act(action_queue, k)).pack(side="left", padx=4)
+
+        self._fade_in()
+        self.win.after(stay_ms, self._fade_out)
+
+    def _act(self, action_queue, key):
+        action_queue.put(key)
+        self._fade_out()
+
+    def _fade_in(self, alpha=0.0):
+        try:
+            alpha = min(0.97, alpha + 0.12)
+            self.win.attributes("-alpha", alpha)
+            if alpha < 0.97:
+                self.win.after(15, lambda: self._fade_in(alpha))
+        except Exception:
+            pass
+
+    def _fade_out(self, alpha=None):
+        if not self.win.winfo_exists():
+            return
+        try:
+            if alpha is None:
+                alpha = self.win.attributes("-alpha")
+            alpha = max(0.0, alpha - 0.12)
+            self.win.attributes("-alpha", alpha)
+            if alpha > 0:
+                self.win.after(15, lambda: self._fade_out(alpha))
+            else:
+                self.win.destroy()
+        except Exception:
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Floating "break due" widget
+# ---------------------------------------------------------------------------
+
+class FloatingWidget:
+    POSITIONS = {
+        "bottom_right": lambda sw, sh, w, h: (sw - w - 24, sh - h - 60),
+        "bottom_left":  lambda sw, sh, w, h: (24, sh - h - 60),
+        "top_right":    lambda sw, sh, w, h: (sw - w - 24, 40),
+        "top_left":     lambda sw, sh, w, h: (24, 40),
+    }
+
+    def __init__(self, root, engine, state, settings, action_queue, theme, state_meta):
+        self.root = root
+        self.engine = engine
+        self.state = state
+        self.settings = settings
+        self.action_queue = action_queue
+        self.theme = theme
+        self.alive = True
+
+        meta = state_meta[state]
+        strict = settings.get("strict_mode", False)
+        show_activity = settings.get("activity_suggestions_enabled", True)
+        h = 190 if show_activity else 140
+        w = 300
+        self.win = tk.Toplevel(root)
+        self.win.overrideredirect(True)
+        try:
+            self.win.attributes("-alpha", 0.0)
+        except Exception:
+            pass
+        self.win.configure(bg=theme["card"])
+
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        pos_fn = self.POSITIONS.get(settings.get("widget_position", "bottom_right"),
+                                     self.POSITIONS["bottom_right"])
+        x, y = pos_fn(sw, sh, w, h)
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
+
+        tk.Frame(self.win, bg=meta["color"], height=6).pack(fill="x")
+        tk.Label(self.win, text=f"{meta['emoji']}  {meta['label']}", bg=theme["card"],
+                 fg=meta["color"], font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=16, pady=(12, 2))
+        self.time_lbl = tk.Label(self.win, text="", bg=theme["card"], fg=theme["text"],
+                                  font=("Segoe UI", 20, "bold"))
+        self.time_lbl.pack(anchor="w", padx=16)
+
+        if show_activity:
+            self.activity_var = tk.StringVar(value=random.choice(_NON_EYE_ACTIVITIES))
+            act_row = tk.Frame(self.win, bg=theme["card"])
+            act_row.pack(fill="x", padx=16, pady=(4, 0))
+            tk.Label(act_row, textvariable=self.activity_var, bg=theme["card"], fg=theme["muted"],
+                     font=("Segoe UI", 8), wraplength=210, justify="left", anchor="w").pack(side="left")
+            tk.Button(act_row, text="🔄", font=("Segoe UI", 8), relief="flat",
+                      bg=theme["card"], fg=theme["muted"], command=self._shuffle_activity
+                      ).pack(side="right")
+
+        btn_row = tk.Frame(self.win, bg=theme["card"])
+        btn_row.pack(fill="x", padx=14, pady=(8, 12))
+        if strict:
+            # Strict still needs a genuine way out — just quiet, not a
+            # prominent invitation to bail.
+            tk.Button(btn_row, text="Exit early", font=("Segoe UI", 7, "underline"),
+                      relief="flat", bd=0, bg=theme["card"], fg=theme["muted"],
+                      command=self._skip).pack(side="left", padx=4)
+        else:
+            tk.Button(btn_row, text="Skip", font=("Segoe UI", 8, "bold"), relief="flat",
+                      bg=theme["border"], fg=theme["text"], padx=10, pady=4,
+                      command=self._skip).pack(side="left", padx=4)
+            tk.Button(btn_row, text=f"Snooze {settings.get('snooze_minutes', 5)}m", font=("Segoe UI", 8, "bold"),
+                      relief="flat", bg=theme["border"], fg=theme["text"], padx=10, pady=4,
+                      command=self._snooze).pack(side="left", padx=4)
+        tk.Button(btn_row, text="Dismiss", font=("Segoe UI", 8, "bold"), relief="flat",
+                  bg=meta["color"], fg="white", padx=10, pady=4,
+                  command=self.destroy_widget).pack(side="right", padx=4)
+
+        self.win.attributes("-topmost", True)
+        self._fade_in()
+        self._update_loop()
+
+    def _shuffle_activity(self):
+        self.activity_var.set(random.choice(_NON_EYE_ACTIVITIES))
+
+    def _skip(self):
+        self.action_queue.put("skip")
+        self.destroy_widget()
+
+    def _snooze(self):
+        self.action_queue.put("snooze_break")
+        self.destroy_widget()
+
+    def _update_loop(self):
+        if not self.alive or not self.win.winfo_exists():
+            return
+        self.time_lbl.config(text=fmt_mmss(self.engine.remaining))
+        if self.engine.state not in ("short_break", "long_break") or not self.engine.running:
+            self.destroy_widget()
+            return
+        self.win.after(1000, self._update_loop)
+
+    def _fade_in(self, alpha=0.0):
+        if not self.win.winfo_exists():
+            return
+        try:
+            alpha = min(0.98, alpha + 0.10)
+            self.win.attributes("-alpha", alpha)
+            if alpha < 0.98:
+                self.win.after(15, lambda: self._fade_in(alpha))
+        except Exception:
+            pass
+
+    def destroy_widget(self):
+        self.alive = False
+        if self.win.winfo_exists():
+            self._fade_out()
+
+    def _fade_out(self, alpha=None):
+        if not self.win.winfo_exists():
+            return
+        try:
+            if alpha is None:
+                alpha = self.win.attributes("-alpha")
+            alpha = max(0.0, alpha - 0.14)
+            self.win.attributes("-alpha", alpha)
+            if alpha > 0:
+                self.win.after(15, lambda: self._fade_out(alpha))
+            else:
+                self.win.destroy()
+        except Exception:
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Full-screen break takeover (optional)
+# ---------------------------------------------------------------------------
+
+class FullscreenBreak:
+    def __init__(self, root, engine, state, settings, action_queue, state_meta):
+        self.engine = engine
+        self.action_queue = action_queue
+        meta = state_meta[state]
+        strict = settings.get("strict_mode", False)
+
+        self.win = tk.Toplevel(root)
+        self.win.configure(bg=meta["color"])
+        self.win.attributes("-topmost", True)
+        try:
+            self.win.attributes("-fullscreen", True)
+        except Exception:
+            sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+            self.win.geometry(f"{sw}x{sh}+0+0")
+
+        wrap = tk.Frame(self.win, bg=meta["color"])
+        wrap.pack(expand=True, fill="both")
+
+        tk.Label(wrap, text=meta["emoji"], bg=meta["color"], fg="white",
+                 font=("Segoe UI", 60)).pack(pady=(60, 10))
+        tk.Label(wrap, text=meta["label"].upper(), bg=meta["color"], fg="white",
+                 font=("Segoe UI", 30, "bold")).pack()
+        self.time_lbl = tk.Label(wrap, text="", bg=meta["color"], fg="white",
+                                  font=("Segoe UI", 60, "bold"))
+        self.time_lbl.pack(pady=20)
+
+        if settings.get("activity_suggestions_enabled", True):
+            tk.Label(wrap, text=random.choice(_NON_EYE_ACTIVITIES), bg=meta["color"], fg="white",
+                     font=("Segoe UI", 13, "bold"), wraplength=560, justify="center").pack(pady=(0, 20))
+
+        # Strict mode is about a stronger nudge, never about trapping the
+        # user on this screen — there is always a way out, just quieter
+        # in Strict so it isn't an obvious invitation to bail.
+        if strict:
+            tk.Button(wrap, text="Exit early", command=self._skip, bg=meta["color"], fg="#ffffff",
+                      font=("Segoe UI", 9, "underline"), relief="flat", bd=0,
+                      activebackground=meta["color"], activeforeground="white").pack(pady=6)
+        else:
+            tk.Button(wrap, text="Skip break", command=self._skip, bg="white", fg=meta["color"],
+                       font=("Segoe UI", 10, "bold"), relief="flat", padx=16, pady=8).pack(pady=6)
+        self.win.bind("<Escape>", lambda e: self._skip())
+
+        self._loop()
+
+    def _skip(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+    def _loop(self):
+        if not self.win.winfo_exists():
+            return
+        self.time_lbl.config(text=fmt_mmss(self.engine.remaining))
+        if self.engine.state not in ("short_break", "long_break"):
+            self.win.destroy()
+            return
+        self.win.after(500, self._loop)
+
+
+# ---------------------------------------------------------------------------
+# 20-20-20 dedicated guided eye-break window
+# ---------------------------------------------------------------------------
+
+class EyeBreakWindow:
+    def __init__(self, root, settings, on_finish):
+        self.settings = settings
+        self.on_finish = on_finish
+        self.seconds_total = settings["rule_look_seconds"]
+        self.seconds_left = self.seconds_total
+        self._pulse = 0.0
+        self._pulse_grow = True
+        self._done_naturally = False
+
+        self.win = tk.Toplevel(root)
+        self.win.title("20-20-20 Eye Break")
+        self.color = BASE_STATE_META["eye_break"]["color"]
+        self.win.configure(bg=self.color)
+        self.win.attributes("-topmost", True)
+        w, h = 620, 520
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        self.win.geometry(f"{w}x{h}+{(sw - w)//2}+{(sh - h)//2}")
+        self.win.resizable(False, False)
+
+        tk.Label(self.win, text="👀  20-20-20 Eye Break", bg=self.color, fg="white",
+                 font=("Segoe UI", 20, "bold")).pack(pady=(28, 4))
+        tk.Label(self.win, text="Look at something about 20 feet (6 meters) away.",
+                 bg=self.color, fg="#f1e9fb", font=("Segoe UI", 12)).pack(pady=(0, 6))
+        tk.Label(self.win, text="Relax — let your eyes blink naturally.",
+                 bg=self.color, fg="#f1e9fb", font=("Segoe UI", 10, "italic")).pack(pady=(0, 10))
+
+        self.canvas = tk.Canvas(self.win, width=260, height=260, bg=self.color, highlightthickness=0)
+        self.canvas.pack(pady=6)
+
+        self.tip_label = tk.Label(self.win, text=random.choice(ACTIVITY_LIBRARY["EYES"]), bg=self.color,
+                                   fg="white", font=("Segoe UI", 11, "bold"), wraplength=480, justify="center")
+        self.tip_label.pack(pady=(14, 6))
+
+        strict = settings.get("strict_mode", False)
+        if strict:
+            tk.Button(self.win, text="Skip", command=self._skip_now, bg=self.color, fg="white",
+                      font=("Segoe UI", 8, "underline"), relief="flat", bd=0,
+                      activebackground=self.color, activeforeground="white").pack(pady=6)
+        else:
+            tk.Button(self.win, text="Skip", command=self._skip_now, bg="white", fg=self.color,
+                       font=("Segoe UI", 9, "bold"), relief="flat", padx=14, pady=6).pack(pady=6)
+        self.win.bind("<Escape>", lambda e: self._skip_now())
+        self.win.protocol("WM_DELETE_WINDOW", self._skip_now)
+
+        self._animate()
+        self._countdown()
+
+    def _animate(self):
+        if not self.win.winfo_exists():
+            return
+        self.canvas.delete("all")
+        cx, cy = 130, 130
+        if self._pulse_grow:
+            self._pulse += 0.02
+            if self._pulse >= 1.0:
+                self._pulse_grow = False
+        else:
+            self._pulse -= 0.02
+            if self._pulse <= 0.0:
+                self._pulse_grow = True
+
+        pulse_r = 70 + 10 * self._pulse
+        self.canvas.create_oval(cx - pulse_r, cy - pulse_r, cx + pulse_r, cy + pulse_r,
+                                 outline="#ffffff", width=2)
+        frac = 1 - (self.seconds_left / self.seconds_total) if self.seconds_total else 0
+        self.canvas.create_arc(cx - 95, cy - 95, cx + 95, cy + 95, start=90, extent=-360 * frac,
+                                style="arc", outline="white", width=6)
+        self.canvas.create_text(cx, cy, text=str(max(0, self.seconds_left)), fill="white",
+                                 font=("Segoe UI", 46, "bold"))
+        self.win.after(40, self._animate)
+
+    def _countdown(self):
+        if not self.win.winfo_exists():
+            return
+        if self.seconds_left <= 0:
+            self._done_naturally = True
+            self._show_confirmation()
+            return
+        self.seconds_left -= 1
+        self.win.after(1000, self._countdown)
+
+    def _show_confirmation(self):
+        play_chime("confirm", self.settings.get("eye_sound_enabled", True))
+        for w in self.win.winfo_children():
+            w.destroy()
+        tk.Label(self.win, text="✅", bg=self.color, fg="white", font=("Segoe UI", 50)).pack(pady=(90, 10))
+        tk.Label(self.win, text="Nice! Your eyes got a reset.", bg=self.color, fg="white",
+                 font=("Segoe UI", 18, "bold")).pack()
+        tk.Label(self.win, text="Back to it whenever you're ready.", bg=self.color, fg="#f1e9fb",
+                 font=("Segoe UI", 10)).pack(pady=(4, 20))
+        tk.Button(self.win, text="Continue", command=self._finish_completed, bg="white", fg=self.color,
+                  font=("Segoe UI", 10, "bold"), relief="flat", padx=16, pady=8).pack()
+        self.win.after(1800, self._finish_completed)
+
+    def _finish_completed(self):
+        self._close()
+        self.on_finish(completed=True)
+
+    def _skip_now(self):
+        self._close()
+        self.on_finish(completed=False)
+
+    def _close(self):
+        try:
+            if self.win.winfo_exists():
+                self.win.destroy()
+        except Exception:
+            pass
+
+    def destroy(self):
+        self._close()
+
+
+# ---------------------------------------------------------------------------
+# Statistics + wellbeing page
+# ---------------------------------------------------------------------------
+
+class StatisticsWindow:
+    def __init__(self, root, engine, history, theme, theme_name):
+        self.engine = engine
+        self.history = history
+        self.theme = theme
+
+        self.win = tk.Toplevel(root)
+        self.win.title("Statistics & Wellbeing")
+        self.win.configure(bg=theme["bg"])
+        self.win.geometry("480x760")
+        self.win.resizable(False, False)
+
+        canvas = tk.Canvas(self.win, bg=theme["bg"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.win, orient="vertical", command=canvas.yview)
+        frame = tk.Frame(canvas, bg=theme["bg"])
+        frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=frame, anchor="nw", width=460)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
+        scrollbar.pack(side="right", fill="y")
+
+        s = engine.stats_snapshot()
+
+        # -- Wellbeing score -------------------------------------------------
+        wb = engine.wellbeing()
+        tk.Label(frame, text="Your daily wellbeing score", bg=theme["bg"], fg=theme["text"],
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=14, pady=(6, 2))
+        tk.Label(frame, text="A simple productivity/wellbeing indicator — not a medical measurement.",
+                 bg=theme["bg"], fg=theme["muted"], font=("Segoe UI", 8), wraplength=430,
+                 justify="left").pack(anchor="w", padx=14, pady=(0, 8))
+
+        score_card = RoundedCard(frame, bg=theme["card"], radius=14)
+        score_card.pack(fill="x", padx=14, pady=4)
+        sc = score_card.inner
+        tk.Label(sc, text=f"{wb['score']} — {wb['label']}", bg=theme["card"],
+                 fg=theme["text"], font=("Segoe UI", 22, "bold")).pack(pady=(14, 4))
+        for emoji, label, value in wb["breakdown"]:
+            row = tk.Frame(sc, bg=theme["card"])
+            row.pack(fill="x", padx=20, pady=2)
+            tk.Label(row, text=f"{emoji} {label}", bg=theme["card"], fg=theme["muted"],
+                     font=("Segoe UI", 9)).pack(side="left")
+            tk.Label(row, text=f"{value}%", bg=theme["card"], fg=theme["text"],
+                     font=("Segoe UI", 9, "bold")).pack(side="right")
+        tk.Label(sc, text=wb["tip"], bg=theme["card"], fg=theme["text"],
+                 font=("Segoe UI", 9, "italic"), wraplength=400, justify="left").pack(
+            padx=16, pady=(10, 14), anchor="w")
+        score_card.finalize()
+
+        # -- Today at a glance -------------------------------------------------
+        tk.Label(frame, text="Today at a glance", bg=theme["bg"], fg=theme["text"],
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=14, pady=(18, 6))
+
+        glance_card = RoundedCard(frame, bg=theme["card"], radius=14)
+        glance_card.pack(fill="x", padx=14, pady=4)
+        glance_grid = tk.Frame(glance_card.inner, bg=theme["card"])
+        glance_grid.pack(padx=14, pady=14)
+        glance_items = [
+            ("Screen time", fmt_hms(s["today_screen_seconds"])),
+            ("Focus time", fmt_hms(s["today_focus_seconds"])),
+            ("Eye breaks", str(s["eye_completed"])),
+            ("Short breaks", str(s["short_completed"])),
+            ("Long breaks", str(s["long_completed"])),
+            ("Focus sessions", str(s["focus_completed"])),
+        ]
+        for i, (label, val) in enumerate(glance_items):
+            col = tk.Frame(glance_grid, bg=theme["card"])
+            col.grid(row=i // 3, column=i % 3, padx=14, pady=6, sticky="w")
+            tk.Label(col, text=val, bg=theme["card"], fg=theme["text"],
+                     font=("Segoe UI", 13, "bold")).pack(anchor="w")
+            tk.Label(col, text=label, bg=theme["card"], fg=theme["muted"],
+                     font=("Segoe UI", 8)).pack(anchor="w")
+        glance_card.finalize()
+
+        # -- Completed vs skipped, break consistency -----------------------------
+        total_completed = s["eye_completed"] + s["short_completed"] + s["long_completed"]
+        total_skipped = s["eye_skipped"] + s["short_skipped"] + s["long_skipped"]
+        consistency = pct(total_completed, total_completed + total_skipped)
+
+        tk.Label(frame, text="Break consistency", bg=theme["bg"], fg=theme["text"],
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=14, pady=(18, 6))
+        consist_card = RoundedCard(frame, bg=theme["card"], radius=14)
+        consist_card.pack(fill="x", padx=14, pady=4)
+        tk.Label(consist_card.inner, text=f"🌱 You completed {consistency}% of your planned breaks.",
+                 bg=theme["card"], fg=theme["text"], font=("Segoe UI", 11, "bold"),
+                 wraplength=400, justify="left").pack(padx=16, pady=(14, 4), anchor="w")
+        tk.Label(consist_card.inner,
+                 text=f"Completed: {total_completed}   ·   Skipped: {total_skipped}",
+                 bg=theme["card"], fg=theme["muted"], font=("Segoe UI", 9)).pack(
+            padx=16, pady=(0, 14), anchor="w")
+        consist_card.finalize()
+
+        # -- Weekly trend chart ------------------------------------------------
+        tk.Label(frame, text="Last 7 days — focus time", bg=theme["bg"], fg=theme["text"],
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=14, pady=(18, 6))
+        chart_card = RoundedCard(frame, bg=theme["card"], radius=14)
+        chart_card.pack(fill="x", padx=14, pady=4)
+
+        days, minutes = self._last_7_days_focus_minutes()
+        chart = BarChart(chart_card.inner, width=430, height=150, theme=theme_name)
+        chart.pack(padx=8, pady=8)
+        chart.draw(days, minutes, "#43a047", unit="m")
+        chart_card.finalize()
+
+        tk.Label(frame, text="", bg=theme["bg"]).pack(pady=10)  # bottom spacer
+
+    def _last_7_days_focus_minutes(self):
+        days, minutes = [], []
+        for i in range(6, -1, -1):
+            d = date.today() - timedelta(days=i)
+            key = str(d)
+            if key == str(date.today()):
+                secs = self.engine.today_focus_seconds
+            else:
+                secs = self.history.get(key, {}).get("today_focus_seconds", 0)
+            days.append(d.strftime("%a"))
+            minutes.append(round(secs / 60))
+        return days, minutes
+
+
+# ---------------------------------------------------------------------------
+# Settings window (tabbed: Timer, 20-20-20, Notifications, Appearance, Behavior)
+# ---------------------------------------------------------------------------
+
+class SettingsWindow:
+    def __init__(self, root, settings, theme, engine, on_save):
+        self.settings = settings
+        self.engine = engine
+        self.on_save = on_save
+        self.theme = theme
+
+        self.win = tk.Toplevel(root)
+        self.win.title("Settings")
+        self.win.configure(bg=theme["bg"])
+        self.win.geometry("460x620")
+        self.win.attributes("-topmost", True)
+
         style = ttk.Style()
         try:
             style.theme_use("clam")
         except Exception:
             pass
+        accent = settings.get("accent_color", "#43a047")
+        style.configure("TNotebook", background=theme["bg"], borderwidth=0, tabmargins=(6, 8, 6, 0))
+        style.configure("TNotebook.Tab", background=theme["border"], foreground=theme["text"],
+                         font=("Segoe UI", 9, "bold"), padding=(12, 6), borderwidth=0)
+        style.map("TNotebook.Tab",
+                  background=[("selected", accent)],
+                  foreground=[("selected", "white")])
 
-        style.configure("TFrame", background=COL_BG)
-        style.configure("Card.TFrame", background=COL_CARD)
-        style.configure("Header.TFrame", background=COL_HEADER)
+        notebook = ttk.Notebook(self.win)
+        notebook.pack(fill="both", expand=True, padx=10, pady=10)
 
-        style.configure("TLabel", background=COL_BG, foreground=COL_TEXT, font=("Segoe UI", 10))
-        style.configure("Card.TLabel", background=COL_CARD, foreground=COL_TEXT, font=("Segoe UI", 10))
-        style.configure("Muted.TLabel", background=COL_CARD, foreground=COL_MUTED, font=("Segoe UI", 9))
-        style.configure("Header.TLabel", background=COL_HEADER, foreground=COL_HEADER_TEXT,
-                         font=("Segoe UI", 17, "bold"))
-        style.configure("HeaderSub.TLabel", background=COL_HEADER, foreground="#dff2e0",
-                         font=("Segoe UI", 9))
-        style.configure("BigTime.TLabel", background=COL_CARD, foreground=COL_PRIMARY_DARK,
-                         font=("Segoe UI", 26, "bold"))
-        style.configure("Countdown.TLabel", background=COL_CARD, foreground=COL_TEXT,
-                         font=("Segoe UI", 40, "bold"))
-        style.configure("StateBadge.TLabel", background=COL_PRIMARY_LIGHT, foreground=COL_PRIMARY_DARK,
-                         font=("Segoe UI", 11, "bold"), padding=(10, 4))
-        style.configure("CardTitle.TLabel", background=COL_CARD, foreground=COL_PRIMARY_DARK,
-                         font=("Segoe UI", 11, "bold"))
+        self.entries = {}
+        self.vars = {}
 
-        # Buttons
-        style.configure("Primary.TButton", background=COL_PRIMARY, foreground="white",
-                         font=("Segoe UI", 10, "bold"), padding=(16, 8), borderwidth=0)
-        style.map("Primary.TButton",
-                  background=[("active", COL_PRIMARY_DARK), ("disabled", "#a9d3ac")])
+        self._build_timer_tab(notebook)
+        self._build_eye_tab(notebook)
+        self._build_notif_tab(notebook)
+        self._build_appearance_tab(notebook)
+        self._build_behavior_tab(notebook)
 
-        style.configure("Warn.TButton", background=COL_WARN, foreground="white",
-                         font=("Segoe UI", 10, "bold"), padding=(16, 8), borderwidth=0)
-        style.map("Warn.TButton",
-                  background=[("active", "#ef6c00"), ("disabled", "#ffcc9c")])
+        btn_frame = tk.Frame(self.win, bg=theme["bg"])
+        btn_frame.pack(side="bottom", fill="x", pady=8)
+        tk.Button(btn_frame, text="Save", command=self._save, bg=self.settings.get("accent_color", "#43a047"),
+                  fg="white", font=("Segoe UI", 10, "bold"), relief="flat", padx=18, pady=8).pack()
 
-        style.configure("Outline.TButton", background=COL_CARD, foreground=COL_PRIMARY_DARK,
-                         font=("Segoe UI", 10, "bold"), padding=(16, 8), borderwidth=1)
-        style.map("Outline.TButton",
-                  background=[("active", COL_PRIMARY_LIGHT)])
+    # -- helpers --------------------------------------------------------------
 
-        style.configure("Green.Horizontal.TProgressbar", troughcolor=COL_PRIMARY_LIGHT,
-                         background=COL_PRIMARY, bordercolor=COL_PRIMARY_LIGHT,
-                         lightcolor=COL_PRIMARY, darkcolor=COL_PRIMARY, thickness=10)
+    def _tab(self, notebook, title):
+        frame = tk.Frame(notebook, bg=self.theme["bg"])
+        notebook.add(frame, text=title)
+        return frame
 
-    # -- UI ----------------------------------------------------------------
+    def _number_field(self, parent, label, key):
+        row = tk.Frame(parent, bg=self.theme["bg"])
+        row.pack(fill="x", padx=10, pady=4)
+        tk.Label(row, text=label, bg=self.theme["bg"], fg=self.theme["muted"], font=("Segoe UI", 9),
+                 wraplength=260, justify="left", anchor="w").pack(side="left")
+        e = ttk.Entry(row, width=6, justify="center")
+        e.insert(0, str(self.settings[key]))
+        e.pack(side="right")
+        self.entries[key] = e
 
-    def _card(self, parent, title=None):
-        outer = tk.Frame(parent, bg=COL_CARD_BORDER)
-        outer.pack(fill="x", padx=18, pady=8)
-        inner = ttk.Frame(outer, style="Card.TFrame")
-        inner.pack(fill="both", expand=True, padx=1, pady=1)
-        if title:
-            ttk.Label(inner, text=title, style="CardTitle.TLabel").pack(
-                anchor="w", padx=14, pady=(10, 0))
-        return inner
+    def _bool_field(self, parent, label, key):
+        var = tk.BooleanVar(value=bool(self.settings.get(key, False)))
+        ttk.Checkbutton(parent, text=label, variable=var).pack(anchor="w", padx=10, pady=4)
+        self.vars[key] = var
 
-    def _build_ui(self):
-        # Header
-        header = ttk.Frame(self.root, style="Header.TFrame")
-        header.pack(fill="x")
-        ttk.Label(header, text="🌿  Screen Break Reminder", style="Header.TLabel").pack(
-            anchor="w", padx=18, pady=(16, 0))
-        ttk.Label(header, text="Pomodoro focus cycles + the 20-20-20 eye rule",
-                  style="HeaderSub.TLabel").pack(anchor="w", padx=18, pady=(2, 16))
+    def _dropdown_field(self, parent, label, key, options):
+        row = tk.Frame(parent, bg=self.theme["bg"])
+        row.pack(fill="x", padx=10, pady=4)
+        tk.Label(row, text=label, bg=self.theme["bg"], fg=self.theme["muted"],
+                 font=("Segoe UI", 9)).pack(side="left")
+        var = tk.StringVar(value=self.settings.get(key, options[0]))
+        combo = ttk.Combobox(row, textvariable=var, values=options, width=14, state="readonly")
+        combo.pack(side="right")
+        self.vars[key] = var
+        return combo
 
-        body = ttk.Frame(self.root)
-        body.pack(fill="both", expand=True)
+    # -- tabs -----------------------------------------------------------------
 
-        # Today's screen time card
-        c1 = self._card(body, "☀  Today's screen time")
-        self.lbl_today = ttk.Label(c1, text="00m 00s", style="BigTime.TLabel")
-        self.lbl_today.pack(padx=14, pady=(4, 14))
+    def _build_timer_tab(self, notebook):
+        f = self._tab(notebook, "Timer")
 
-        # Pomodoro card
-        c2 = self._card(body, "🍅  Pomodoro timer")
+        tk.Label(f, text="Preset", bg=self.theme["bg"], fg=self.theme["text"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
+        preset_names = list(PRESETS.keys()) + list(self.settings.get("custom_presets", {}).keys()) + ["Custom"]
+        combo = self._dropdown_field(f, "Choose a preset", "active_preset", preset_names)
+        combo.bind("<<ComboboxSelected>>", lambda e: self._apply_preset())
 
-        self.lbl_state = ttk.Label(c2, text="Idle", style="StateBadge.TLabel")
-        self.lbl_state.pack(padx=14, pady=(8, 4))
+        tk.Label(f, text="Timings", bg=self.theme["bg"], fg=self.theme["text"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(14, 2))
+        self._number_field(f, "Focus duration (min)", "work_minutes")
+        self._number_field(f, "Short break duration (min)", "short_break_minutes")
+        self._number_field(f, "Long break duration (min)", "long_break_minutes")
+        self._number_field(f, "Sessions before long break", "cycles_before_long_break")
+        self._number_field(f, "Heads-up warning before break (sec)", "warning_seconds")
 
-        self.lbl_countdown = ttk.Label(c2, text="25:00", style="Countdown.TLabel")
-        self.lbl_countdown.pack(pady=(2, 6))
+        save_row = tk.Frame(f, bg=self.theme["bg"])
+        save_row.pack(fill="x", padx=10, pady=(14, 4))
+        tk.Label(save_row, text="Save current timings as:", bg=self.theme["bg"],
+                 fg=self.theme["muted"], font=("Segoe UI", 9)).pack(side="left")
+        self.new_preset_entry = ttk.Entry(save_row, width=14)
+        self.new_preset_entry.pack(side="left", padx=6)
+        tk.Button(save_row, text="Save preset", command=self._save_custom_preset,
+                  bg=self.theme["border"], fg=self.theme["text"], relief="flat",
+                  font=("Segoe UI", 8, "bold"), padx=8, pady=3).pack(side="left")
 
-        self.progress = ttk.Progressbar(c2, style="Green.Horizontal.TProgressbar",
-                                         orient="horizontal", length=360, mode="determinate",
-                                         maximum=100, value=0)
-        self.progress.pack(padx=20, pady=(0, 8))
+    def _apply_preset(self):
+        name = self.vars["active_preset"].get()
+        preset = PRESETS.get(name) or self.settings.get("custom_presets", {}).get(name)
+        if not preset:
+            return  # "Custom" -> leave fields as-is
+        for key, val in preset.items():
+            if key in self.entries:
+                self.entries[key].delete(0, tk.END)
+                self.entries[key].insert(0, str(val))
 
-        self.lbl_cycles = ttk.Label(c2, text="Completed work sessions: 0", style="Card.TLabel")
-        self.lbl_cycles.pack(pady=(0, 10))
-
-        btn_row = ttk.Frame(c2, style="Card.TFrame")
-        btn_row.pack(pady=(0, 16))
-        self.btn_start = ttk.Button(btn_row, text="▶  Start", style="Primary.TButton",
-                                     command=self.start_pomodoro)
-        self.btn_start.grid(row=0, column=0, padx=5)
-        self.btn_pause = ttk.Button(btn_row, text="⏸  Pause", style="Warn.TButton",
-                                     command=self.pause_pomodoro, state="disabled")
-        self.btn_pause.grid(row=0, column=1, padx=5)
-        self.btn_reset = ttk.Button(btn_row, text="↺  Reset", style="Outline.TButton",
-                                     command=self.reset_pomodoro)
-        self.btn_reset.grid(row=0, column=2, padx=5)
-
-        # 20-20-20 card
-        c3 = self._card(body, "👁  20-20-20 rule")
-        ttk.Label(c3, text="Every 20 minutes, look at something 20 feet away for 20 seconds.",
-                  style="Muted.TLabel", wraplength=380, justify="left").pack(
-            padx=14, pady=(4, 6), anchor="w")
-        self.lbl_rule_countdown = ttk.Label(c3, text="Next reminder in: 20:00", style="Card.TLabel")
-        self.lbl_rule_countdown.pack(padx=14, pady=(0, 14), anchor="w")
-
-        # Settings + sound toggle
-        controls = ttk.Frame(body)
-        controls.pack(fill="x", padx=18, pady=(4, 4))
-
-        self.sound_var = tk.BooleanVar(value=self.settings.get("sound_enabled", True))
-        sound_chk = ttk.Checkbutton(controls, text="🔊 Play sound on breaks",
-                                     variable=self.sound_var, command=self._toggle_sound)
-        sound_chk.pack(side="left")
-
-        settings_btn = ttk.Button(controls, text="⚙  Settings", style="Outline.TButton",
-                                   command=self.open_settings)
-        settings_btn.pack(side="right")
-
-        ttk.Label(body, text="Tip: keep this window open (minimizing is fine) so it can\n"
-                              "keep tracking and pop up your reminders.",
-                  style="Muted.TLabel", background=COL_BG, justify="center").pack(pady=(6, 14))
-
-    def _toggle_sound(self):
-        self.settings["sound_enabled"] = self.sound_var.get()
-        self._persist()
-
-    # -- Pomodoro control ----------------------------------------------------
-
-    def start_pomodoro(self):
-        if self.state == "idle":
-            self.state = "work"
-            self.remaining = self.settings["work_minutes"] * 60
-            self.phase_total = self.remaining
-        self.pomodoro_running = True
-        self.tracking = True
-        self.warned_pomodoro = False
-        self.btn_start.config(state="disabled")
-        self.btn_pause.config(state="normal")
-        self._refresh_labels()
-
-    def pause_pomodoro(self):
-        self.pomodoro_running = False
-        self.btn_start.config(state="normal")
-        self.btn_pause.config(state="disabled")
-
-    def reset_pomodoro(self):
-        self.pomodoro_running = False
-        self.state = "idle"
-        self.cycle_count = 0
-        self.remaining = self.settings["work_minutes"] * 60
-        self.phase_total = self.remaining
-        self.warned_pomodoro = False
-        self.btn_start.config(state="normal")
-        self.btn_pause.config(state="disabled")
-        self._refresh_labels()
-
-    def _advance_pomodoro_phase(self):
-        self.warned_pomodoro = False
-        if self.state == "work":
-            self.cycle_count += 1
-            if self.cycle_count % self.settings["cycles_before_long_break"] == 0:
-                self.state = "long_break"
-                self.remaining = self.settings["long_break_minutes"] * 60
-                msg = (f"Great job — {self.cycle_count} work sessions done today.\n\n"
-                       f"Take a long break: {self.settings['long_break_minutes']} minutes.")
-            else:
-                self.state = "short_break"
-                self.remaining = self.settings["short_break_minutes"] * 60
-                msg = f"Nice work! Take a short break: {self.settings['short_break_minutes']} minutes."
-            self.phase_total = self.remaining
-            if self.settings.get("sound_enabled", True):
-                play_chime("break")
-            self._show_popup("🍃 Break time!", msg)
-        else:
-            self.state = "work"
-            self.remaining = self.settings["work_minutes"] * 60
-            self.phase_total = self.remaining
-            if self.settings.get("sound_enabled", True):
-                play_chime("break")
-            self._show_popup("🍅 Back to focus",
-                              f"Break's over. Let's focus for {self.settings['work_minutes']} minutes.")
-        self._refresh_labels()
-
-    # -- 30-second heads-up warnings ------------------------------------------
-
-    def _show_warning_toast(self, text):
-        """A small, borderless, auto-dismissing notice in the corner of
-        the screen — doesn't interrupt what you're doing, just a heads-up."""
-        if self.settings.get("sound_enabled", True):
-            play_chime("warning")
-
-        toast = tk.Toplevel(self.root)
-        toast.overrideredirect(True)
-        toast.attributes("-topmost", True)
-        try:
-            toast.attributes("-alpha", 0.96)
-        except Exception:
-            pass
-        toast.configure(bg=COL_PRIMARY_DARK)
-
-        w, h = 320, 70
-        sw = toast.winfo_screenwidth()
-        sh = toast.winfo_screenheight()
-        x = sw - w - 24
-        y = sh - h - 60
-        toast.geometry(f"{w}x{h}+{x}+{y}")
-
-        tk.Label(toast, text=text, bg=COL_PRIMARY_DARK, fg="white",
-                 font=("Segoe UI", 10, "bold"), wraplength=290, justify="left").pack(
-            expand=True, fill="both", padx=14, pady=10)
-
-        toast.after(4000, lambda: toast.destroy() if toast.winfo_exists() else None)
-
-    # -- 20-20-20 rule --------------------------------------------------------
-
-    def _trigger_202020(self):
-        self.warned_eye = False
-        self._show_202020_popup()
-        self.rule_elapsed = 0
-
-    def _show_202020_popup(self):
-        if self.popup_open:
+    def _save_custom_preset(self):
+        name = self.new_preset_entry.get().strip()
+        if not name:
+            messagebox.showerror("Name needed", "Give your preset a name first.")
             return
-        self.popup_open = True
-        seconds = self.settings["rule_look_seconds"]
-        tip = random.choice(EYE_TIPS)
-
-        if self.settings.get("sound_enabled", True):
-            play_chime("break")
-
-        win = tk.Toplevel(self.root)
-        win.title("Eye Break")
-        win.configure(bg=COL_EYE_BG)
-        win.attributes("-topmost", True)
         try:
-            # Try to go full-screen for maximum visibility
-            win.attributes("-fullscreen", True)
-        except Exception:
-            sw = win.winfo_screenwidth()
-            sh = win.winfo_screenheight()
-            win.geometry(f"{sw}x{sh}+0+0")
+            preset = dict(
+                work_minutes=int(self.entries["work_minutes"].get()),
+                short_break_minutes=int(self.entries["short_break_minutes"].get()),
+                long_break_minutes=int(self.entries["long_break_minutes"].get()),
+                cycles_before_long_break=int(self.entries["cycles_before_long_break"].get()),
+                # the 20-20-20 tab's fields aren't on this tab, so fall back to
+                # whatever is currently saved in settings for those two values
+                rule_interval_minutes=self.settings["rule_interval_minutes"],
+                rule_look_seconds=self.settings["rule_look_seconds"],
+            )
+        except ValueError:
+            messagebox.showerror("Invalid input", "Please fix the timing fields first.")
+            return
+        self.settings.setdefault("custom_presets", {})[name] = preset
+        messagebox.showinfo("Saved", f"Preset '{name}' saved.")
 
-        wrap = tk.Frame(win, bg=COL_EYE_BG)
-        wrap.pack(expand=True, fill="both")
+    def _build_eye_tab(self, notebook):
+        f = self._tab(notebook, "20-20-20")
+        self._bool_field(f, "Enable 20-20-20 reminders", "eye_rule_enabled")
+        self._number_field(f, "Interval between reminders (min)", "rule_interval_minutes")
+        self._number_field(f, "Look-away duration (sec)", "rule_look_seconds")
+        self._bool_field(f, "🔊 Play sound", "eye_sound_enabled")
 
-        tk.Label(wrap, text="👁", bg=COL_EYE_BG, fg="white",
-                 font=("Segoe UI", 60)).pack(pady=(60, 0))
-        tk.Label(wrap, text="LOOK AWAY FROM YOUR SCREEN", bg=COL_EYE_BG, fg="white",
-                 font=("Segoe UI", 30, "bold")).pack(pady=(10, 6))
-        tk.Label(wrap, text="Focus on something about 20 feet (6 meters) away.",
-                 bg=COL_EYE_BG, fg="#e8f5e9", font=("Segoe UI", 14)).pack(pady=(0, 30))
+    def _build_notif_tab(self, notebook):
+        f = self._tab(notebook, "Notifications")
+        self._bool_field(f, "Enable notifications", "notifications_enabled")
+        self._bool_field(f, "🔊 Notification sound", "notification_sound")
+        self._number_field(f, "Snooze duration (min)", "snooze_minutes")
+        tk.Label(f, text="Break reminder style", bg=self.theme["bg"], fg=self.theme["text"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(14, 2))
+        self._bool_field(f, "Show floating widget when a break starts", "floating_widget_enabled")
+        self._bool_field(f, "Full-screen break takeover instead of widget", "fullscreen_break_mode")
+        self._dropdown_field(f, "Floating widget position", "widget_position",
+                              ["bottom_right", "bottom_left", "top_right", "top_left"])
+        self._bool_field(f, "Suggest a quick activity during breaks", "activity_suggestions_enabled")
 
-        lbl_count = tk.Label(wrap, text=str(seconds), bg=COL_EYE_BG, fg="white",
-                              font=("Segoe UI", 64, "bold"))
-        lbl_count.pack(pady=6)
+    def _build_appearance_tab(self, notebook):
+        f = self._tab(notebook, "Appearance")
+        self._dropdown_field(f, "Theme", "theme", ["light", "dark", "system"])
+        row = tk.Frame(f, bg=self.theme["bg"])
+        row.pack(fill="x", padx=10, pady=10)
+        tk.Label(row, text="Accent color", bg=self.theme["bg"], fg=self.theme["muted"],
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.accent_preview = tk.Label(row, text="   ", bg=self.settings.get("accent_color", "#43a047"))
+        self.accent_preview.pack(side="right", padx=(6, 0))
+        tk.Button(row, text="Choose…", command=self._pick_accent, relief="flat",
+                  bg=self.theme["border"], fg=self.theme["text"], font=("Segoe UI", 8, "bold"),
+                  padx=8, pady=3).pack(side="right")
 
-        tk.Label(wrap, text="While you wait, you could also:", bg=COL_EYE_BG,
-                 fg="#c8e6c9", font=("Segoe UI", 11, "italic")).pack(pady=(24, 4))
-        tk.Label(wrap, text=tip, bg=COL_EYE_BG, fg="white",
-                 font=("Segoe UI", 14, "bold"), wraplength=560, justify="center").pack(pady=(0, 20))
+    def _pick_accent(self):
+        color = colorchooser.askcolor(color=self.settings.get("accent_color", "#43a047"))
+        if color and color[1]:
+            self.settings["accent_color"] = color[1]
+            self.accent_preview.configure(bg=color[1])
 
-        def countdown(n):
-            if not win.winfo_exists():
-                return
-            if n <= 0:
-                self.popup_open = False
-                win.destroy()
-                return
-            lbl_count.config(text=str(n))
-            win.after(1000, countdown, n - 1)
+    def _build_behavior_tab(self, notebook):
+        f = self._tab(notebook, "Behavior")
+        self._bool_field(f, "Start with Windows", "start_with_windows")
+        self._bool_field(f, "Minimize to tray instead of closing", "minimize_to_tray")
+        self._bool_field(f, "Smart breaks (pause tracking when you're away)", "smart_breaks")
 
-        countdown(seconds)
+        tk.Label(f, text="Break mode", bg=self.theme["bg"], fg=self.theme["text"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(16, 2))
+        self._dropdown_field(f, "Gentle / Strict", "strict_mode_choice",
+                              ["Gentle", "Strict"])
+        self.vars["strict_mode_choice"].set("Strict" if self.settings.get("strict_mode") else "Gentle")
 
-        def on_close():
-            self.popup_open = False
-            win.destroy()
+        desc = tk.Frame(f, bg=self.theme["card"], highlightbackground=self.theme["border"],
+                         highlightthickness=1)
+        desc.pack(fill="x", padx=10, pady=(8, 4))
+        tk.Label(desc, text="🕊  Gentle", bg=self.theme["card"], fg=self.theme["text"],
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
+        tk.Label(desc, text="Subtle notifications, a small floating widget, snooze available.",
+                 bg=self.theme["card"], fg=self.theme["muted"], font=("Segoe UI", 8),
+                 wraplength=380, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+        tk.Label(desc, text="🎯  Strict", bg=self.theme["card"], fg=self.theme["text"],
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=10, pady=(0, 0))
+        tk.Label(desc, text="More prominent, longer notifications, no snooze, and pairs well with "
+                            "full-screen breaks (Notifications tab) for stronger discipline.",
+                 bg=self.theme["card"], fg=self.theme["muted"], font=("Segoe UI", 8),
+                 wraplength=380, justify="left").pack(anchor="w", padx=10, pady=(0, 4))
+        tk.Label(desc, text="Either way, you can always exit a break early — Strict just makes "
+                            "that option quieter, never unavailable.",
+                 bg=self.theme["card"], fg=self.theme["muted"], font=("Segoe UI", 8, "italic"),
+                 wraplength=380, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
-        win.protocol("WM_DELETE_WINDOW", on_close)
-        tk.Button(wrap, text="Skip", command=on_close, bg="white", fg=COL_PRIMARY_DARK,
-                  font=("Segoe UI", 10, "bold"), relief="flat", padx=18, pady=8).pack(pady=10)
-        # allow Escape key to dismiss too
-        win.bind("<Escape>", lambda e: on_close())
+        if not HAS_TRAY:
+            tk.Label(f, text="Tray options need: pip install pystray pillow",
+                     bg=self.theme["bg"], fg=self.theme["muted"], font=("Segoe UI", 8)).pack(
+                anchor="w", padx=10, pady=(10, 0))
 
-    # -- Popups -----------------------------------------------------------
+    # -- save -------------------------------------------------------------------
 
-    def _show_popup(self, title, message):
+    def _save(self):
         try:
-            self.root.deiconify()
-            self.root.lift()
-            self.root.attributes("-topmost", True)
-            self.root.after(200, lambda: self.root.attributes("-topmost", False))
-        except Exception:
-            pass
-        messagebox.showinfo(title, message)
+            for key, entry in self.entries.items():
+                val = int(entry.get())
+                if val <= 0:
+                    raise ValueError
+                self.settings[key] = val
+        except ValueError:
+            messagebox.showerror("Invalid input", "Please enter positive whole numbers only.")
+            return
 
-    # -- Settings dialog ----------------------------------------------------
+        for key, var in self.vars.items():
+            if key == "strict_mode_choice":
+                continue
+            self.settings[key] = var.get()
 
-    def open_settings(self):
-        win = tk.Toplevel(self.root)
-        win.title("Settings")
-        win.configure(bg=COL_BG)
-        win.geometry("380x440")
-        win.resizable(False, False)
-        win.attributes("-topmost", True)
+        self.settings["strict_mode"] = self.vars["strict_mode_choice"].get().startswith("Strict")
 
-        tk.Label(win, text="⚙  Settings", bg=COL_BG, fg=COL_PRIMARY_DARK,
-                 font=("Segoe UI", 13, "bold")).pack(pady=(14, 10))
+        prev_start = self.settings.get("_prev_start_with_windows", False)
+        if self.settings.get("start_with_windows") != prev_start:
+            set_start_with_windows(self.settings.get("start_with_windows", False))
+        self.settings["_prev_start_with_windows"] = self.settings.get("start_with_windows", False)
 
-        fields = [
-            ("Work minutes", "work_minutes"),
-            ("Short break minutes", "short_break_minutes"),
-            ("Long break minutes", "long_break_minutes"),
-            ("Work sessions before long break", "cycles_before_long_break"),
-            ("20-20-20 interval (minutes)", "rule_interval_minutes"),
-            ("20-20-20 look-away duration (seconds)", "rule_look_seconds"),
-            ("Heads-up warning before break (seconds)", "warning_seconds"),
-        ]
-        form = tk.Frame(win, bg=COL_BG)
-        form.pack(padx=16, pady=6, fill="x")
-        entries = {}
-        for i, (label, key) in enumerate(fields):
-            tk.Label(form, text=label, bg=COL_BG, fg=COL_TEXT, font=("Segoe UI", 9),
-                     anchor="w", wraplength=230, justify="left").grid(
-                row=i, column=0, sticky="w", pady=6)
-            e = ttk.Entry(form, width=6, justify="center")
-            e.insert(0, str(self.settings[key]))
-            e.grid(row=i, column=1, padx=10, pady=6)
-            entries[key] = e
+        self.win.destroy()
+        self.on_save()
 
-        def save_and_close():
-            try:
-                for key, entry in entries.items():
-                    val = int(entry.get())
-                    if val <= 0:
-                        raise ValueError
-                    self.settings[key] = val
-            except ValueError:
-                messagebox.showerror("Invalid input", "Please enter positive whole numbers only.")
-                return
-            self._persist()
-            self.reset_pomodoro()
-            win.destroy()
 
-        ttk.Button(win, text="Save", style="Primary.TButton", command=save_and_close).pack(pady=18)
-
-    # -- Tick loop ------------------------------------------------------------
-
-    def _tick(self):
-        today = str(date.today())
-        if getattr(self, "_last_date", today) != today:
-            self.today_seconds = 0
-        self._last_date = today
-
-        warn_secs = self.settings.get("warning_seconds", 30)
-
-        if self.tracking:
-            self.today_seconds += 1
-            self.rule_elapsed += 1
-
-            rule_remaining = self.settings["rule_interval_minutes"] * 60 - self.rule_elapsed
-            if (not self.warned_eye) and 0 < rule_remaining <= warn_secs:
-                self.warned_eye = True
-                self._show_warning_toast(
-                    f"👁  Eye break coming up in {warn_secs} seconds — get ready to look away.")
-
-            if self.rule_elapsed >= self.settings["rule_interval_minutes"] * 60:
-                self._trigger_202020()
-
-        if self.pomodoro_running:
-            if (self.state == "work"
-                    and not self.warned_pomodoro
-                    and 0 < self.remaining <= warn_secs):
-                self.warned_pomodoro = True
-                self._show_warning_toast(
-                    f"⏳  Break starting in {warn_secs} seconds — wrap up what you're doing.")
-
-            if self.remaining > 0:
-                self.remaining -= 1
-            else:
-                self._advance_pomodoro_phase()
-
-        self._refresh_labels()
-        self._persist()
-        self.root.after(1000, self._tick)
-
-    # -- Helpers --------------------------------------------------------------
-
-    def _refresh_labels(self):
-        self.lbl_today.config(text=fmt_hms(self.today_seconds))
-
-        state_names = {
-            "idle": "Idle — press Start",
-            "work": "🍅 Focus / Work",
-            "short_break": "☕ Short Break",
-            "long_break": "🌴 Long Break",
-        }
-        self.lbl_state.config(text=state_names.get(self.state, self.state))
-        self.lbl_countdown.config(text=fmt_mmss(self.remaining))
-        self.lbl_cycles.config(text=f"Completed work sessions: {self.cycle_count}")
-
-        if self.phase_total > 0:
-            done = self.phase_total - self.remaining
-            pct = max(0, min(100, (done / self.phase_total) * 100))
-        else:
-            pct = 0
-        self.progress["value"] = pct
-
-        rule_remaining = self.settings["rule_interval_minutes"] * 60 - self.rule_elapsed
-        suffix = "" if self.tracking else "  (press Start to begin tracking)"
-        self.lbl_rule_countdown.config(text=f"Next reminder in: {fmt_mmss(rule_remaining)}{suffix}")
-
-    def _persist(self):
-        save_data({
-            "settings": self.settings,
-            "today_seconds": self.today_seconds,
-            "last_date": str(date.today()),
-        })
-
-    def on_close(self):
-        self._persist()
-        self.root.destroy()
-
+# ---------------------------------------------------------------------------
+# App bootstrap
+# ---------------------------------------------------------------------------
 
 def main():
+    stored = load_data()
+    settings = dict(DEFAULTS)
+    settings.update(stored.get("settings", {}))
+
+    today = str(date.today())
+    persisted_stats = stored.get("stats", {}) if stored.get("last_date") == today else {}
+    history = stored.get("history", {})
+    if stored.get("last_date") and stored.get("last_date") != today and stored.get("stats"):
+        # the app was closed on a previous day without a clean shutdown archive
+        history.setdefault(stored["last_date"], stored["stats"])
+
+    action_queue = queue.Queue()
     root = tk.Tk()
-    app = ScreenBreakApp(root)
+    engine_holder = {}
+
+    def on_event(event, **kwargs):
+        dash = engine_holder.get("dashboard")
+        if dash is not None:
+            dash.on_engine_event(event, **kwargs)
+
+    engine = TimerEngine(settings, on_event)
+    engine.reset_all(persisted=persisted_stats)
+
+    notifier = NotificationManager(settings, action_queue)
+    tray = TrayManager(engine, action_queue, settings)
+
+    dashboard = Dashboard(root, engine, settings, action_queue, notifier, tray, history)
+    engine_holder["dashboard"] = dashboard
+
+    tray.start()
     root.mainloop()
 
 

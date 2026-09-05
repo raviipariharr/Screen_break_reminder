@@ -1,13 +1,65 @@
 {
   "settings": {
-    "work_minutes": 1,
+    "work_minutes": 30,
     "short_break_minutes": 5,
     "long_break_minutes": 15,
     "cycles_before_long_break": 4,
-    "rule_interval_minutes": 1,
+    "warning_seconds": 30,
+    "active_preset": "Classic",
+    "eye_rule_enabled": true,
+    "rule_interval_minutes": 20,
     "rule_look_seconds": 20,
-    "sound_enabled": true
+    "eye_sound_enabled": true,
+    "notifications_enabled": true,
+    "notification_sound": true,
+    "snooze_minutes": 5,
+    "sound_enabled": true,
+    "floating_widget_enabled": true,
+    "fullscreen_break_mode": false,
+    "widget_position": "bottom_right",
+    "activity_suggestions_enabled": true,
+    "theme": "light",
+    "accent_color": "#43a047",
+    "start_with_windows": false,
+    "minimize_to_tray": true,
+    "smart_breaks": false,
+    "strict_mode": false,
+    "custom_presets": {},
+    "_prev_start_with_windows": false
   },
-  "today_seconds": 2119,
-  "last_date": "2026-09-04"
+  "last_date": "2026-09-05",
+  "stats": {
+    "today_focus_seconds": 9,
+    "today_break_seconds": 0,
+    "today_screen_seconds": 9,
+    "eye_completed": 0,
+    "eye_skipped": 0,
+    "short_completed": 0,
+    "short_skipped": 0,
+    "long_completed": 0,
+    "long_skipped": 0,
+    "focus_completed": 0,
+    "focus_skipped": 1
+  },
+  "history": {
+    "2026-09-04": {
+      "today_focus_seconds": 0,
+      "today_break_seconds": 0,
+      "today_screen_seconds": 0,
+      "eye_breaks_taken": 0
+    },
+    "2026-09-05": {
+      "today_focus_seconds": 9,
+      "today_break_seconds": 0,
+      "today_screen_seconds": 9,
+      "eye_completed": 0,
+      "eye_skipped": 0,
+      "short_completed": 0,
+      "short_skipped": 0,
+      "long_completed": 0,
+      "long_skipped": 0,
+      "focus_completed": 0,
+      "focus_skipped": 1
+    }
+  }
 }
