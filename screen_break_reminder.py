@@ -315,22 +315,42 @@ def resolve_theme(settings):
 # ---------------------------------------------------------------------------
 
 class TimerEngine:
+    """The timer's correctness never depends on how often tick() is
+    called or how much time actually passed between calls. Every
+    countdown is derived from an absolute wall-clock deadline
+    (time.time()), recomputed fresh on every read — so a minimized
+    window, a delayed callback, or the system going to sleep and
+    waking back up can never cause drift. tick() is just a periodic
+    nudge to check "has a deadline passed yet?", not the source of
+    truth for how much time is left.
+    """
+
+    AWAY_THRESHOLD = 90     # seconds idle before Smart Breaks treats you as away
+    GAP_THRESHOLD = 5       # a tick arriving later than this implies a real
+                            # gap (sleep, suspend, heavy system load) rather
+                            # than normal ~1s polling
+
     def __init__(self, settings, on_event):
         self.settings = settings
         self.on_event = on_event
-        self.eye_break_active = False
         self.reset_all(persisted=None)
 
     def reset_all(self, persisted=None):
         self.state = "idle"
-        self.remaining = self.settings["work_minutes"] * 60
-        self.phase_total = self.remaining
         self.running = False
+        self.phase_end = None            # epoch seconds; deadline for the current phase
+        self.phase_total = self.settings["work_minutes"] * 60
+        self._paused_phase_remaining = None
+
+        self.eye_break_active = False
+        self.eye_end = None              # epoch seconds; deadline for the next eye break
+        self.eye_total = self.settings["rule_interval_minutes"] * 60
+        self._paused_eye_remaining = None
+
         self.cycle_count = 0
-        self.rule_elapsed = 0
         self.warned_break = False
         self.warned_eye = False
-        self.eye_break_active = False
+        self._last_tick_epoch = time.time()
 
         p = persisted or {}
         self.today_focus_seconds = p.get("today_focus_seconds", 0)
@@ -344,23 +364,64 @@ class TimerEngine:
         self.long_skipped = p.get("long_skipped", 0)
         self.focus_skipped = p.get("focus_skipped", 0)
 
-    # -- controls ---------------------------------------------------------
+    # -- live countdowns, always derived from wall-clock deadlines -----------
+
+    @property
+    def remaining(self):
+        if self.state == "idle":
+            return float(self.settings["work_minutes"] * 60)
+        if not self.running and self._paused_phase_remaining is not None:
+            return self._paused_phase_remaining
+        if self.phase_end is None:
+            return float(self.phase_total)
+        return max(0.0, self.phase_end - time.time())
+
+    @property
+    def eye_remaining(self):
+        if self.eye_end is None:
+            return float(self.settings["rule_interval_minutes"] * 60)
+        if not self.running and self._paused_eye_remaining is not None:
+            return self._paused_eye_remaining
+        return max(0.0, self.eye_end - time.time())
+
+    # -- controls -------------------------------------------------------------
 
     def start(self):
+        now = time.time()
         if self.state == "idle":
             self.state = "focus"
-            self.remaining = self.settings["work_minutes"] * 60
-            self.phase_total = self.remaining
+            self.phase_total = self.settings["work_minutes"] * 60
+            self.phase_end = now + self.phase_total
+            if self.settings.get("eye_rule_enabled", True):
+                self.eye_total = self.settings["rule_interval_minutes"] * 60
+                self.eye_end = now + self.eye_total
         self.running = True
+        self._paused_phase_remaining = None
+        self._paused_eye_remaining = None
         self.on_event("changed")
 
     def pause(self):
+        if self.running:
+            self._paused_phase_remaining = self.remaining if self.state != "idle" else None
+            self._paused_eye_remaining = self.eye_remaining if self.eye_end is not None else None
         self.running = False
         self.on_event("changed")
 
     def resume(self):
-        if self.state != "idle":
-            self.running = True
+        if self.state == "idle":
+            self.on_event("changed")
+            return
+        now = time.time()
+        self.phase_end = now + (self._paused_phase_remaining
+                                 if self._paused_phase_remaining is not None
+                                 else self.phase_total)
+        if self.settings.get("eye_rule_enabled", True):
+            remaining = (self._paused_eye_remaining if self._paused_eye_remaining is not None
+                         else self.eye_total)
+            self.eye_end = now + remaining
+        self.running = True
+        self._paused_phase_remaining = None
+        self._paused_eye_remaining = None
         self.on_event("changed")
 
     def restart(self):
@@ -372,23 +433,24 @@ class TimerEngine:
     def skip(self):
         if self.state in ("focus", "short_break", "long_break"):
             self._record_skip(self.state)
-            self._advance()
+            self._advance(time.time())
         self.on_event("changed")
 
     def snooze_eye(self, minutes):
-        self.rule_elapsed = max(0, self.settings["rule_interval_minutes"] * 60 - minutes * 60)
+        self.eye_end = time.time() + minutes * 60
         self.warned_eye = False
         self.eye_break_active = False
         self.on_event("changed")
 
     def snooze_break(self, minutes):
-        self.remaining += minutes * 60
+        if self.phase_end is not None:
+            self.phase_end += minutes * 60
+        self.phase_total += minutes * 60
         self.warned_break = False
         self.on_event("changed")
 
     def trigger_eye_break_now(self):
         self.warned_eye = False
-        self.rule_elapsed = 0
         self.eye_break_active = True
         self.on_event("eye_break_due")
 
@@ -398,48 +460,74 @@ class TimerEngine:
             self.eye_completed += 1
         else:
             self.eye_skipped += 1
+        now = time.time()
+        if self.running and self.settings.get("eye_rule_enabled", True):
+            self.eye_total = self.settings["rule_interval_minutes"] * 60
+            self.eye_end = now + self.eye_total
+        else:
+            self.eye_end = None
         self.on_event("changed")
 
-    # -- per-tick update ----------------------------------------------------
+    # -- per-tick check ---------------------------------------------------------
 
     def tick(self, idle_seconds=0.0):
-        smart = self.settings.get("smart_breaks", False)
-        is_away = smart and idle_seconds >= 90  # treat >90s idle as "already away"
+        """Call roughly once a second. Late, early, or occasionally-missed
+        calls are all fine — correctness comes entirely from comparing
+        the stored deadlines to the current wall-clock time, not from
+        counting how many times this ran."""
+        now = time.time()
+        delta = now - self._last_tick_epoch
+        self._last_tick_epoch = now
 
-        if self.running and not is_away:
-            self.today_screen_seconds += 1
+        if self.running:
+            smart = self.settings.get("smart_breaks", False)
+            is_away = smart and idle_seconds >= self.AWAY_THRESHOLD
+            gap = delta > self.GAP_THRESHOLD
 
-        if (self.running and not is_away and self.settings.get("eye_rule_enabled", True)
-                and not self.eye_break_active):
-            self.rule_elapsed += 1
-            warn = self.settings["warning_seconds"]
-            eye_total = self.settings["rule_interval_minutes"] * 60
-            remain_eye = eye_total - self.rule_elapsed
-            if not self.warned_eye and 0 < remain_eye <= warn:
-                self.warned_eye = True
-                self.on_event("eye_warning")
-            if self.rule_elapsed >= eye_total:
-                self.warned_eye = False
-                self.rule_elapsed = 0
-                self.eye_break_active = True
-                self.on_event("eye_break_due")
+            if gap:
+                # A real gap in execution — system sleep/suspend, the app
+                # was heavily delayed, etc. Let the wall-clock deadlines
+                # reflect the real time that passed (so, e.g., a break
+                # correctly finishes even if you were asleep through it) —
+                # just don't count that dead air as tracked screen time.
+                pass
+            elif is_away:
+                # A normal ~1s tick, but you haven't touched the keyboard/
+                # mouse in a while and the PC never slept — Smart Breaks
+                # pauses the countdown for as long as you're away, one
+                # second at a time, then resumes exactly where it left off.
+                if self.phase_end is not None:
+                    self.phase_end += delta
+                if self.eye_end is not None:
+                    self.eye_end += delta
+            elif delta > 0:
+                self.today_screen_seconds += delta
+                if self.state == "focus":
+                    self.today_focus_seconds += delta
+                elif self.state in ("short_break", "long_break"):
+                    self.today_break_seconds += delta
 
-        if self.running and not is_away and self.state in ("focus", "short_break", "long_break"):
-            if self.state == "focus":
-                self.today_focus_seconds += 1
-            else:
-                self.today_break_seconds += 1
+            if (self.settings.get("eye_rule_enabled", True) and not self.eye_break_active
+                    and self.eye_end is not None):
+                remain_eye = self.eye_end - now
+                warn = self.settings["warning_seconds"]
+                if not self.warned_eye and 0 < remain_eye <= warn:
+                    self.warned_eye = True
+                    self.on_event("eye_warning")
+                if remain_eye <= 0:
+                    self.warned_eye = False
+                    self.eye_break_active = True
+                    self.on_event("eye_break_due")
 
-            warn = self.settings["warning_seconds"]
-            if self.state == "focus" and not self.warned_break and 0 < self.remaining <= warn:
-                self.warned_break = True
-                self.on_event("break_warning")
-
-            if self.remaining > 0:
-                self.remaining -= 1
-            else:
-                self._record_completion(self.state)
-                self._advance()
+            if self.state in ("focus", "short_break", "long_break") and self.phase_end is not None:
+                remain = self.phase_end - now
+                warn = self.settings["warning_seconds"]
+                if self.state == "focus" and not self.warned_break and 0 < remain <= warn:
+                    self.warned_break = True
+                    self.on_event("break_warning")
+                if remain <= 0:
+                    self._record_completion(self.state)
+                    self._advance(now)
 
         self.on_event("tick")
 
@@ -458,23 +546,22 @@ class TimerEngine:
         elif state == "focus":
             self.focus_skipped += 1
 
-    def _advance(self):
+    def _advance(self, now=None):
+        now = now if now is not None else time.time()
         self.warned_break = False
         if self.state == "focus":
             self.cycle_count += 1
             if self.cycle_count % self.settings["cycles_before_long_break"] == 0:
                 self.state = "long_break"
-                self.remaining = self.settings["long_break_minutes"] * 60
+                self.phase_total = self.settings["long_break_minutes"] * 60
             else:
                 self.state = "short_break"
-                self.remaining = self.settings["short_break_minutes"] * 60
-            self.phase_total = self.remaining
-            self.on_event("phase_changed", new_state=self.state)
+                self.phase_total = self.settings["short_break_minutes"] * 60
         else:
             self.state = "focus"
-            self.remaining = self.settings["work_minutes"] * 60
-            self.phase_total = self.remaining
-            self.on_event("phase_changed", new_state=self.state)
+            self.phase_total = self.settings["work_minutes"] * 60
+        self.phase_end = now + self.phase_total
+        self.on_event("phase_changed", new_state=self.state)
 
     def display_state(self):
         if self.eye_break_active:
@@ -482,6 +569,69 @@ class TimerEngine:
         if self.state == "focus" and self.warned_break:
             return "break_soon"
         return self.state
+
+    # -- persistence: settings/stats are handled elsewhere; this is just
+    # the *live* timer state, so a restart or crash can resume seamlessly --
+
+    def to_dict(self):
+        return dict(
+            state=self.state,
+            running=self.running,
+            phase_end=self.phase_end,
+            phase_total=self.phase_total,
+            paused_phase_remaining=self._paused_phase_remaining,
+            eye_end=self.eye_end,
+            eye_total=self.eye_total,
+            paused_eye_remaining=self._paused_eye_remaining,
+            cycle_count=self.cycle_count,
+            warned_break=self.warned_break,
+            warned_eye=self.warned_eye,
+            saved_at=time.time(),
+        )
+
+    def restore(self, d):
+        """Recover live timer state saved by a previous run. Safe to call
+        with None (nothing to recover -> stays idle)."""
+        if not d:
+            return
+        self.state = d.get("state", "idle")
+        self.running = d.get("running", False)
+        self.phase_end = d.get("phase_end")
+        self.phase_total = d.get("phase_total", self.settings["work_minutes"] * 60)
+        self._paused_phase_remaining = d.get("paused_phase_remaining")
+        self.eye_end = d.get("eye_end")
+        self.eye_total = d.get("eye_total", self.settings["rule_interval_minutes"] * 60)
+        self._paused_eye_remaining = d.get("paused_eye_remaining")
+        self.cycle_count = d.get("cycle_count", 0)
+        self.warned_break = d.get("warned_break", False)
+        self.warned_eye = d.get("warned_eye", False)
+        self.eye_break_active = False  # never restore into a mid-flight modal window
+        self._last_tick_epoch = time.time()
+
+        if not self.running:
+            return
+
+        now = time.time()
+        # If a deadline already passed while the app was closed, crashed,
+        # or the system was asleep, reconcile silently — advance the state
+        # exactly once and reset the eye cycle — rather than firing
+        # notifications for events that (as far as the user is concerned)
+        # already happened in the past. This is what keeps a restart from
+        # producing duplicate or backdated alerts.
+        if (self.state in ("focus", "short_break", "long_break")
+                and self.phase_end is not None and self.phase_end <= now):
+            original_cb = self.on_event
+            self.on_event = lambda *a, **k: None
+            try:
+                self._record_completion(self.state)
+                self._advance(now)
+            finally:
+                self.on_event = original_cb
+        if (self.eye_end is not None and self.eye_end <= now
+                and self.settings.get("eye_rule_enabled", True)):
+            self.eye_total = self.settings["rule_interval_minutes"] * 60
+            self.eye_end = now + self.eye_total
+            self.warned_eye = False
 
     def stats_snapshot(self):
         return dict(
@@ -1101,6 +1251,8 @@ class Dashboard:
         elif action == "quit":
             self._quit()
         self._refresh()
+        if action != "quit":
+            self._persist()
 
     def _quit(self):
         self._archive_today()
@@ -1249,8 +1401,7 @@ class Dashboard:
             frac = 0.0
         self.ring.set_progress(frac, meta["color"])
 
-        eye_total = self.settings["rule_interval_minutes"] * 60
-        eye_remaining = eye_total - self.engine.rule_elapsed
+        eye_remaining = self.engine.eye_remaining
         eye_suffix = "" if self.settings.get("eye_rule_enabled", True) else " (disabled)"
         self.lbl_next_eye.config(text=f"Next eye break in: {fmt_mmss(eye_remaining)}{eye_suffix}")
         self.lbl_cycles.config(text=f"Focus sessions completed: {self.engine.cycle_count}")
@@ -1272,6 +1423,7 @@ class Dashboard:
             "last_date": self._last_date,
             "stats": self.engine.stats_snapshot(),
             "history": self.history,
+            "engine_state": self.engine.to_dict(),
         })
 
 
@@ -2038,10 +2190,6 @@ class SettingsWindow:
         self.win.destroy()
         self.on_save()
 
-
-# ---------------------------------------------------------------------------
-# App bootstrap
-# ---------------------------------------------------------------------------
 
 def main():
     stored = load_data()

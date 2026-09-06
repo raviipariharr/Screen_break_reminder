@@ -1,11 +1,11 @@
 {
   "settings": {
-    "work_minutes": 30,
+    "work_minutes": 20,
     "short_break_minutes": 5,
     "long_break_minutes": 15,
     "cycles_before_long_break": 4,
     "warning_seconds": 30,
-    "active_preset": "Classic",
+    "active_preset": "20-20-20 Focus",
     "eye_rule_enabled": true,
     "rule_interval_minutes": 20,
     "rule_look_seconds": 20,
@@ -27,19 +27,19 @@
     "custom_presets": {},
     "_prev_start_with_windows": false
   },
-  "last_date": "2026-09-05",
+  "last_date": "2026-09-06",
   "stats": {
-    "today_focus_seconds": 9,
-    "today_break_seconds": 0,
-    "today_screen_seconds": 9,
-    "eye_completed": 0,
+    "today_focus_seconds": 3859,
+    "today_break_seconds": 335,
+    "today_screen_seconds": 4194,
+    "eye_completed": 3,
     "eye_skipped": 0,
-    "short_completed": 0,
-    "short_skipped": 0,
+    "short_completed": 1,
+    "short_skipped": 2,
     "long_completed": 0,
     "long_skipped": 0,
-    "focus_completed": 0,
-    "focus_skipped": 1
+    "focus_completed": 3,
+    "focus_skipped": 2
   },
   "history": {
     "2026-09-04": {
@@ -49,9 +49,9 @@
       "eye_breaks_taken": 0
     },
     "2026-09-05": {
-      "today_focus_seconds": 9,
+      "today_focus_seconds": 79,
       "today_break_seconds": 0,
-      "today_screen_seconds": 9,
+      "today_screen_seconds": 79,
       "eye_completed": 0,
       "eye_skipped": 0,
       "short_completed": 0,
