@@ -154,7 +154,7 @@ DEFAULTS = {
     "activity_suggestions_enabled": True,
     # Appearance
     "theme": "light",              # light, dark, system
-    "accent_color": "#43a047",
+    "accent_color": "#3FA34D",
     # Behavior
     "start_with_windows": False,
     "minimize_to_tray": True,
@@ -210,9 +210,17 @@ def load_data():
 
 
 def save_data(data):
+    """Writes atomically (temp file + rename) so a crash or power loss
+    mid-write can never corrupt the saved settings/stats/timer-state —
+    the rename is a single filesystem operation, so the file is always
+    either the old complete version or the new complete version."""
     try:
-        with open(DATA_FILE, "w") as f:
+        tmp_path = DATA_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, DATA_FILE)
     except Exception:
         pass
 
@@ -279,19 +287,24 @@ def play_chime(kind="break", enabled=True, emphasize=False):
 # ---------------------------------------------------------------------------
 
 THEMES = {
-    "light": dict(bg="#f4faf5", card="#ffffff", text="#1b2e1f", muted="#63756a",
-                  border="#dcece0", ring_track="#e7f1e9"),
-    "dark": dict(bg="#101a14", card="#17251c", text="#eaf5ec", muted="#9db8a8",
-                 border="#20362a", ring_track="#22392b"),
+    "light": dict(bg="#FAF8F4", card="#FFFFFF", text="#23262B", muted="#75726C",
+                  border="#E9E4DC", ring_track="#F0ECE5", border_soft="#F0ECE5"),
+    "dark": dict(bg="#16181C", card="#1F2226", text="#EDEBE7", muted="#9A968E",
+                 border="#2C2F35", ring_track="#25282D", border_soft="#25282D"),
 }
 
+INDIGO = "#6E62E5"
+INDIGO_WASH = {"light": "#EEEBFC", "dark": "#242047"}
+AMBER = "#C98A1E"
+AMBER_WASH = {"light": "#FBF1DF", "dark": "#3A2E14"}
+
 BASE_STATE_META = {
-    "idle":        dict(color="#607d8b", light="#eceff1", label="Idle",               emoji="⚪"),
-    "focus":       dict(color="#2e7d32", light="#e8f5e9", label="Focus",              emoji="🟢"),
-    "break_soon":  dict(color="#a6790a", light="#fdf3e0", label="Break Soon",         emoji="🟡"),
-    "short_break": dict(color="#1565c0", light="#e3f2fd", label="Short Break",        emoji="🔵"),
-    "long_break":  dict(color="#00695c", light="#e0f2f1", label="Long Break",         emoji="🌿"),
-    "eye_break":   dict(color="#6a3fb5", light="#ede7f6", label="20-20-20 Eye Break", emoji="👀"),
+    "idle":        dict(color="#8A8680", light="#F0ECE5", label="Idle",               emoji="⚪"),
+    "focus":       dict(color="#3FA34D", light="#EAF6EC", label="Focus",              emoji="🟢"),
+    "break_soon":  dict(color="#C98A1E", light="#FBF1DF", label="Break Soon",         emoji="🟡"),
+    "short_break": dict(color="#6E62E5", light="#EEEBFC", label="Short Break",        emoji="🔵"),
+    "long_break":  dict(color="#3FA34D", light="#EAF6EC", label="Long Break",         emoji="🌿"),
+    "eye_break":   dict(color="#3FA34D", light="#EAF6EC", label="20-20-20 Eye Break", emoji="👀"),
 }
 
 
@@ -299,7 +312,7 @@ def get_state_meta(settings):
     """A copy of the state metadata with the Focus color swapped for the
     user's chosen accent color."""
     meta = {k: dict(v) for k, v in BASE_STATE_META.items()}
-    meta["focus"]["color"] = settings.get("accent_color", "#43a047")
+    meta["focus"]["color"] = settings.get("accent_color", "#3FA34D")
     return meta
 
 
@@ -336,16 +349,26 @@ class TimerEngine:
         self.reset_all(persisted=None)
 
     def reset_all(self, persisted=None):
+        # Pomodoro / focus timer — optional, off by default.
         self.state = "idle"
         self.running = False
         self.phase_end = None            # epoch seconds; deadline for the current phase
         self.phase_total = self.settings["work_minutes"] * 60
         self._paused_phase_remaining = None
 
+        # 20-20-20 eye-break timer — this is the app's main purpose, so it
+        # runs independently of the Pomodoro timer and starts on its own
+        # as soon as the app launches (if enabled in Settings). You don't
+        # need to start a focus session just to get eye-break reminders.
         self.eye_break_active = False
-        self.eye_end = None              # epoch seconds; deadline for the next eye break
         self.eye_total = self.settings["rule_interval_minutes"] * 60
         self._paused_eye_remaining = None
+        self.eye_running = False
+        self.eye_end = None
+        if self.settings.get("eye_rule_enabled", True):
+            now = time.time()
+            self.eye_running = True
+            self.eye_end = now + self.eye_total
 
         self.cycle_count = 0
         self.warned_break = False
@@ -380,30 +403,27 @@ class TimerEngine:
     def eye_remaining(self):
         if self.eye_end is None:
             return float(self.settings["rule_interval_minutes"] * 60)
-        if not self.running and self._paused_eye_remaining is not None:
+        if not self.eye_running and self._paused_eye_remaining is not None:
             return self._paused_eye_remaining
         return max(0.0, self.eye_end - time.time())
 
-    # -- controls -------------------------------------------------------------
+    # -- Pomodoro / focus timer controls (entirely optional) -------------------
 
     def start(self):
+        """Start (or resume) an optional Focus session. Does not affect
+        eye-break tracking, which runs independently."""
         now = time.time()
         if self.state == "idle":
             self.state = "focus"
             self.phase_total = self.settings["work_minutes"] * 60
             self.phase_end = now + self.phase_total
-            if self.settings.get("eye_rule_enabled", True):
-                self.eye_total = self.settings["rule_interval_minutes"] * 60
-                self.eye_end = now + self.eye_total
         self.running = True
         self._paused_phase_remaining = None
-        self._paused_eye_remaining = None
         self.on_event("changed")
 
     def pause(self):
         if self.running:
             self._paused_phase_remaining = self.remaining if self.state != "idle" else None
-            self._paused_eye_remaining = self.eye_remaining if self.eye_end is not None else None
         self.running = False
         self.on_event("changed")
 
@@ -415,19 +435,21 @@ class TimerEngine:
         self.phase_end = now + (self._paused_phase_remaining
                                  if self._paused_phase_remaining is not None
                                  else self.phase_total)
-        if self.settings.get("eye_rule_enabled", True):
-            remaining = (self._paused_eye_remaining if self._paused_eye_remaining is not None
-                         else self.eye_total)
-            self.eye_end = now + remaining
         self.running = True
         self._paused_phase_remaining = None
-        self._paused_eye_remaining = None
         self.on_event("changed")
 
     def restart(self):
-        """Restart the current cycle from a fresh, running Focus session,
-        keeping today's stats intact."""
-        self.reset_all(persisted=self.stats_snapshot())
+        """Restart the current Focus cycle from a fresh, running session,
+        keeping today's stats and eye-break tracking intact."""
+        stats = self.stats_snapshot()
+        was_eye_running = self.eye_running
+        paused_eye_remaining = self._paused_eye_remaining
+        self.reset_all(persisted=stats)
+        if not was_eye_running:
+            # preserve a deliberately-paused eye timer across a Pomodoro restart
+            self.eye_running = False
+            self._paused_eye_remaining = paused_eye_remaining
         self.start()
 
     def skip(self):
@@ -436,17 +458,40 @@ class TimerEngine:
             self._advance(time.time())
         self.on_event("changed")
 
-    def snooze_eye(self, minutes):
-        self.eye_end = time.time() + minutes * 60
-        self.warned_eye = False
-        self.eye_break_active = False
-        self.on_event("changed")
-
     def snooze_break(self, minutes):
         if self.phase_end is not None:
             self.phase_end += minutes * 60
         self.phase_total += minutes * 60
         self.warned_break = False
+        self.on_event("changed")
+
+    # -- 20-20-20 eye-break controls (independent of the Pomodoro timer) -------
+
+    def start_eye(self):
+        """Turn eye-break tracking on (this is the default/main mode)."""
+        now = time.time()
+        if not self.eye_running:
+            self.eye_total = self.settings["rule_interval_minutes"] * 60
+            remaining = (self._paused_eye_remaining if self._paused_eye_remaining is not None
+                         else self.eye_total)
+            self.eye_end = now + remaining
+            self._paused_eye_remaining = None
+        self.eye_running = True
+        self.on_event("changed")
+
+    def pause_eye(self):
+        """Turn eye-break tracking off, e.g. if you don't want reminders
+        right now. Independent of the Pomodoro timer."""
+        if self.eye_running:
+            self._paused_eye_remaining = self.eye_remaining
+        self.eye_running = False
+        self.warned_eye = False
+        self.on_event("changed")
+
+    def snooze_eye(self, minutes):
+        self.eye_end = time.time() + minutes * 60
+        self.warned_eye = False
+        self.eye_break_active = False
         self.on_event("changed")
 
     def trigger_eye_break_now(self):
@@ -461,7 +506,7 @@ class TimerEngine:
         else:
             self.eye_skipped += 1
         now = time.time()
-        if self.running and self.settings.get("eye_rule_enabled", True):
+        if self.eye_running:
             self.eye_total = self.settings["rule_interval_minutes"] * 60
             self.eye_end = now + self.eye_total
         else:
@@ -474,12 +519,16 @@ class TimerEngine:
         """Call roughly once a second. Late, early, or occasionally-missed
         calls are all fine — correctness comes entirely from comparing
         the stored deadlines to the current wall-clock time, not from
-        counting how many times this ran."""
+        counting how many times this ran.
+
+        Eye-break tracking and the Pomodoro focus timer are independent:
+        either can be running while the other is off."""
         now = time.time()
         delta = now - self._last_tick_epoch
         self._last_tick_epoch = now
 
-        if self.running:
+        active = self.eye_running or self.running
+        if active:
             smart = self.settings.get("smart_breaks", False)
             is_away = smart and idle_seconds >= self.AWAY_THRESHOLD
             gap = delta > self.GAP_THRESHOLD
@@ -494,21 +543,22 @@ class TimerEngine:
             elif is_away:
                 # A normal ~1s tick, but you haven't touched the keyboard/
                 # mouse in a while and the PC never slept — Smart Breaks
-                # pauses the countdown for as long as you're away, one
-                # second at a time, then resumes exactly where it left off.
-                if self.phase_end is not None:
+                # pauses whichever timer(s) are active, one second at a
+                # time, then resumes exactly where they left off.
+                if self.running and self.phase_end is not None:
                     self.phase_end += delta
-                if self.eye_end is not None:
+                if self.eye_running and self.eye_end is not None:
                     self.eye_end += delta
             elif delta > 0:
                 self.today_screen_seconds += delta
-                if self.state == "focus":
-                    self.today_focus_seconds += delta
-                elif self.state in ("short_break", "long_break"):
-                    self.today_break_seconds += delta
+                if self.running:
+                    if self.state == "focus":
+                        self.today_focus_seconds += delta
+                    elif self.state in ("short_break", "long_break"):
+                        self.today_break_seconds += delta
 
-            if (self.settings.get("eye_rule_enabled", True) and not self.eye_break_active
-                    and self.eye_end is not None):
+            if (self.eye_running and self.settings.get("eye_rule_enabled", True)
+                    and not self.eye_break_active and self.eye_end is not None):
                 remain_eye = self.eye_end - now
                 warn = self.settings["warning_seconds"]
                 if not self.warned_eye and 0 < remain_eye <= warn:
@@ -519,7 +569,8 @@ class TimerEngine:
                     self.eye_break_active = True
                     self.on_event("eye_break_due")
 
-            if self.state in ("focus", "short_break", "long_break") and self.phase_end is not None:
+            if (self.running and self.state in ("focus", "short_break", "long_break")
+                    and self.phase_end is not None):
                 remain = self.phase_end - now
                 warn = self.settings["warning_seconds"]
                 if self.state == "focus" and not self.warned_break and 0 < remain <= warn:
@@ -580,6 +631,7 @@ class TimerEngine:
             phase_end=self.phase_end,
             phase_total=self.phase_total,
             paused_phase_remaining=self._paused_phase_remaining,
+            eye_running=self.eye_running,
             eye_end=self.eye_end,
             eye_total=self.eye_total,
             paused_eye_remaining=self._paused_eye_remaining,
@@ -591,7 +643,8 @@ class TimerEngine:
 
     def restore(self, d):
         """Recover live timer state saved by a previous run. Safe to call
-        with None (nothing to recover -> stays idle)."""
+        with None (nothing to recover -> falls back to the normal
+        defaults set by reset_all: Pomodoro idle, eye tracking auto-on)."""
         if not d:
             return
         self.state = d.get("state", "idle")
@@ -599,6 +652,7 @@ class TimerEngine:
         self.phase_end = d.get("phase_end")
         self.phase_total = d.get("phase_total", self.settings["work_minutes"] * 60)
         self._paused_phase_remaining = d.get("paused_phase_remaining")
+        self.eye_running = d.get("eye_running", self.settings.get("eye_rule_enabled", True))
         self.eye_end = d.get("eye_end")
         self.eye_total = d.get("eye_total", self.settings["rule_interval_minutes"] * 60)
         self._paused_eye_remaining = d.get("paused_eye_remaining")
@@ -608,17 +662,15 @@ class TimerEngine:
         self.eye_break_active = False  # never restore into a mid-flight modal window
         self._last_tick_epoch = time.time()
 
-        if not self.running:
-            return
-
         now = time.time()
         # If a deadline already passed while the app was closed, crashed,
         # or the system was asleep, reconcile silently — advance the state
         # exactly once and reset the eye cycle — rather than firing
         # notifications for events that (as far as the user is concerned)
         # already happened in the past. This is what keeps a restart from
-        # producing duplicate or backdated alerts.
-        if (self.state in ("focus", "short_break", "long_break")
+        # producing duplicate or backdated alerts. The two timers are
+        # reconciled independently since either can be running alone.
+        if (self.running and self.state in ("focus", "short_break", "long_break")
                 and self.phase_end is not None and self.phase_end <= now):
             original_cb = self.on_event
             self.on_event = lambda *a, **k: None
@@ -627,7 +679,7 @@ class TimerEngine:
                 self._advance(now)
             finally:
                 self.on_event = original_cb
-        if (self.eye_end is not None and self.eye_end <= now
+        if (self.eye_running and self.eye_end is not None and self.eye_end <= now
                 and self.settings.get("eye_rule_enabled", True)):
             self.eye_total = self.settings["rule_interval_minutes"] * 60
             self.eye_end = now + self.eye_total
@@ -718,9 +770,17 @@ class NotificationManager:
                     toast.AddAction(ToastButton(label, f"action={key}"))
 
                 def on_activated(args):
-                    arg = getattr(args, "arguments", "") or ""
-                    if arg.startswith("action="):
-                        self._dispatch(arg.split("=", 1)[1])
+                    # This runs on a WinRT/COM callback thread, not the Tk
+                    # thread — never touch UI objects here directly. Just
+                    # push onto the thread-safe queue and let the Tk main
+                    # loop's _poll_actions pick it up. Guard broadly so a
+                    # malformed callback can never crash that thread.
+                    try:
+                        arg = getattr(args, "arguments", "") or ""
+                        if arg.startswith("action="):
+                            self._dispatch(arg.split("=", 1)[1])
+                    except Exception:
+                        pass
 
                 toast.on_activated = on_activated
                 self.toaster.show_toast(toast)
@@ -758,7 +818,12 @@ class TrayManager:
         return img
 
     def _status_text(self, item=None):
-        meta = get_state_meta(self.settings)[self.engine.display_state()]
+        disp = self.engine.display_state()
+        meta = get_state_meta(self.settings)[disp]
+        if disp == "idle":
+            if self.engine.eye_running:
+                return f"👀 Eye breaks on — next in {fmt_mmss(self.engine.eye_remaining)}"
+            return "⚪ Idle — eye breaks paused"
         return f"{meta['emoji']} {meta['label']} — {fmt_mmss(self.engine.remaining)}"
 
     def _pause_resume_text(self, item=None):
@@ -767,14 +832,22 @@ class TrayManager:
     def _q(self, action):
         return lambda icon=None, item=None: self.action_queue.put(action)
 
+    def _eye_toggle_text(self, item=None):
+        return "⏸  Pause eye-break reminders" if self.engine.eye_running else "▶  Resume eye-break reminders"
+
+    def _toggle_eye(self, icon=None, item=None):
+        self.action_queue.put("toggle_eye")
+
     def _build(self):
         menu = pystray.Menu(
             pystray.MenuItem(self._status_text, None, enabled=False),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(self._eye_toggle_text, self._toggle_eye),
+            pystray.MenuItem("👀  Take an eye break now", self._q("start_eye_break")),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._pause_resume_text, self._q("toggle_pause")),
             pystray.MenuItem("⏭  Skip", self._q("skip")),
             pystray.MenuItem("↺  Restart", self._q("restart")),
-            pystray.MenuItem("👀  Start 20-20-20 Now", self._q("start_eye_break")),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("🖥  Open Dashboard", self._q("open_dashboard"), default=True),
             pystray.MenuItem("📊  Statistics", self._q("open_stats")),
@@ -936,6 +1009,52 @@ class RoundedCard(tk.Frame):
 
 
 # ---------------------------------------------------------------------------
+# Switch — a small pill-shaped on/off toggle drawn on a Canvas, matching
+# the modern switch controls in the redesigned UI (tkinter's built-in
+# Checkbutton can't be restyled to look like this).
+# ---------------------------------------------------------------------------
+
+class Switch(tk.Canvas):
+    def __init__(self, parent, bg, on_color, off_color, value=False, command=None, width=40, height=23):
+        super().__init__(parent, width=width, height=height, bg=bg, highlightthickness=0, cursor="hand2")
+        self.on_color = on_color
+        self.off_color = off_color
+        self.value = value
+        self.command = command
+        self.w = width
+        self.h = height
+        self.bind("<Button-1>", self._on_click)
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        r = self.h / 2
+        track_color = self.on_color if self.value else self.off_color
+        self.create_oval(0, 0, self.h, self.h, fill=track_color, outline=track_color)
+        self.create_oval(self.w - self.h, 0, self.w, self.h, fill=track_color, outline=track_color)
+        self.create_rectangle(r, 0, self.w - r, self.h, fill=track_color, outline=track_color)
+        knob_x = (self.w - r) if self.value else r
+        pad = 2.5
+        self.create_oval(knob_x - r + pad, pad, knob_x + r - pad, self.h - pad,
+                          fill="#FFFFFF", outline="")
+
+    def _on_click(self, event=None):
+        self.set(not self.value)
+        if self.command:
+            self.command(self.value)
+
+    def set(self, value):
+        self.value = bool(value)
+        self._draw()
+
+    def set_colors(self, bg, on_color, off_color):
+        self.on_color = on_color
+        self.off_color = off_color
+        self.configure(bg=bg)
+        self._draw()
+
+
+# ---------------------------------------------------------------------------
 # Main dashboard window
 # ---------------------------------------------------------------------------
 
@@ -954,8 +1073,8 @@ class Dashboard:
         self._last_date = str(date.today())
 
         self.root.title("Screen Break Reminder")
-        self.root.geometry("500x780")
-        self.root.minsize(440, 640)
+        self.root.geometry("980x760")
+        self.root.minsize(760, 600)
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_button)
 
@@ -963,6 +1082,7 @@ class Dashboard:
         self._build_ui()
         self._apply_theme()
         self._refresh()
+        self._built_once = True
 
         self.root.after(1000, self._tick_loop)
         self.root.after(200, self._poll_actions)
@@ -987,7 +1107,7 @@ class Dashboard:
 
     def _apply_theme(self):
         t = self.theme()
-        accent = self.settings.get("accent_color", "#43a047")
+        accent = self.settings.get("accent_color", "#3FA34D")
         self.root.configure(bg=t["bg"])
         if hasattr(self, "outer_canvas"):
             self.outer_canvas.configure(bg=t["bg"])
@@ -1010,16 +1130,17 @@ class Dashboard:
                      font=("Segoe UI", 10, "bold"), padding=(14, 8), borderwidth=1)
         s.map("Outline.TButton", background=[("active", t["border"])])
 
-        for widget_name in ("card1", "card2", "card3"):
-            w = getattr(self, widget_name, None)
-            if w is not None:
-                w.set_colors(t["bg"], t["card"])
-        if hasattr(self, "ring"):
-            self.ring.set_theme(self.theme_name())
-        if hasattr(self, "hero"):
-            self.hero.configure(bg=accent)
-            for child in self.hero.winfo_children():
-                child.configure(bg=accent)
+        # A full-dashboard color scheme now touches a lot of individually
+        # colored widgets (icon tiles, switches, the streak pill, etc.).
+        # Rather than patch each one by hand — fragile and easy to miss a
+        # spot — we simply rebuild the body content fresh against the new
+        # theme/accent. This is cheap for a dashboard this size and can't
+        # drift out of sync the way manual re-coloring can.
+        if getattr(self, "_built_once", False) and hasattr(self, "body"):
+            for child in self.body.winfo_children():
+                child.destroy()
+            self._build_body_content()
+            self._refresh()
 
     def _card(self, parent, accent_strip=False):
         """A genuinely rounded, softly elevated card — see RoundedCard."""
@@ -1027,7 +1148,7 @@ class Dashboard:
         card.pack(fill="x", padx=20, pady=(0, 16))
         strip = None
         if accent_strip:
-            strip = tk.Frame(card.inner, bg=self.settings.get("accent_color", "#43a047"), height=4)
+            strip = tk.Frame(card.inner, bg=self.settings.get("accent_color", "#3FA34D"), height=4)
             strip.pack(fill="x", side="top")
         inner = ttk.Frame(card.inner, style="Card.TFrame")
         inner.pack(fill="both", expand=True)
@@ -1065,35 +1186,125 @@ class Dashboard:
 
     def _build_ui(self):
         self._build_scroll_container()
-        accent = self.settings.get("accent_color", "#43a047")
-        self.hero = tk.Frame(self.body, bg=accent)
-        self.hero.pack(fill="x")
-        tk.Label(self.hero, text="🌿  Screen Break Reminder", bg=accent, fg="white",
-                 font=("Segoe UI", 19, "bold")).pack(anchor="w", padx=24, pady=(22, 2))
-        tk.Label(self.hero, text="Calm, focused work — with breaks that actually happen.",
-                 bg=accent, fg="#ffffff", font=("Segoe UI", 9)).pack(anchor="w", padx=24, pady=(0, 20))
+        self._build_body_content()
 
-        self.card1, timer_card, self.timer_strip = self._card(self.body, accent_strip=True)
-        self.state_badge = tk.Label(timer_card, text="Idle", font=("Segoe UI", 12, "bold"))
-        self.state_badge.pack(pady=(22, 8))
+    def _build_body_content(self):
+        t = self.theme()
+        accent = self.settings.get("accent_color", "#3FA34D")
 
-        ring_wrap = ttk.Frame(timer_card, style="Card.TFrame")
-        ring_wrap.pack(pady=4)
-        self.ring = ProgressRing(ring_wrap, size=230, thickness=15, theme=self.theme_name())
+        # -- Compact header: small logo mark, title/subtitle, streak,
+        # settings + theme icons. Deliberately not a big colored band —
+        # the rings inside the cards are where the visual weight goes.
+        header = tk.Frame(self.body, bg=t["bg"])
+        header.pack(fill="x", padx=20, pady=(16, 8))
+
+        left = tk.Frame(header, bg=t["bg"])
+        left.pack(side="left")
+        logo = tk.Canvas(left, width=34, height=34, bg=t["bg"], highlightthickness=0)
+        logo.pack(side="left", padx=(0, 10))
+        self._draw_logo(logo, accent)
+        title_wrap = tk.Frame(left, bg=t["bg"])
+        title_wrap.pack(side="left")
+        tk.Label(title_wrap, text="Screen Break", bg=t["bg"], fg=t["text"],
+                 font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        tk.Label(title_wrap, text="Protect your eyes. Stay focused.", bg=t["bg"], fg=t["muted"],
+                 font=("Segoe UI", 8)).pack(anchor="w")
+
+        right = tk.Frame(header, bg=t["bg"])
+        right.pack(side="right")
+        self.streak_pill = tk.Label(right, text="🔥 0 day streak", bg=AMBER_WASH[self.theme_name()],
+                                     fg=AMBER, font=("Segoe UI", 9, "bold"), padx=10, pady=5)
+        self.streak_pill.pack(side="left", padx=(0, 8))
+        tk.Button(right, text="🌙", bg=t["card"], fg=t["muted"], relief="flat", bd=1,
+                  font=("Segoe UI", 10), width=3, command=self._on_theme_toggle_icon
+                  ).pack(side="left", padx=(0, 6))
+        tk.Button(right, text="⚙", bg=t["card"], fg=t["muted"], relief="flat", bd=1,
+                  font=("Segoe UI", 10), width=3, command=self._open_full_settings
+                  ).pack(side="left")
+
+        # -- two-column layout --
+        columns = tk.Frame(self.body, bg=t["bg"])
+        columns.pack(fill="both", expand=True, padx=20, pady=(4, 16))
+        columns.columnconfigure(0, weight=3, uniform="col")
+        columns.columnconfigure(1, weight=2, uniform="col")
+
+        left_col = tk.Frame(columns, bg=t["bg"])
+        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        right_col = tk.Frame(columns, bg=t["bg"])
+        right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        # ===== LEFT COLUMN =====
+
+        # -- Eye-break card: this is the app's main purpose, so it comes
+        # first and works completely on its own — no focus session needed.
+        eye_meta = BASE_STATE_META["eye_break"]
+        self.card0, eye_card, self.eye_strip = self._card(left_col, accent_strip=True)
+        self.eye_strip.configure(bg=eye_meta["color"])
+
+        eye_head = ttk.Frame(eye_card, style="Card.TFrame")
+        eye_head.pack(fill="x", padx=16, pady=(16, 2))
+        eye_title_col = ttk.Frame(eye_head, style="Card.TFrame")
+        eye_title_col.pack(side="left")
+        ttk.Label(eye_title_col, text="Eye Breaks", style="Card.TLabel",
+                  font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        ttk.Label(eye_title_col, text="20-20-20 rule", style="Muted.TLabel").pack(anchor="w")
+        self.eye_status_badge = tk.Label(eye_head, text="Active", font=("Segoe UI", 9, "bold"))
+        self.eye_status_badge.pack(side="right", anchor="n")
+
+        eye_body = ttk.Frame(eye_card, style="Card.TFrame")
+        eye_body.pack(fill="x", padx=16, pady=(10, 6))
+        ring_wrap = ttk.Frame(eye_body, style="Card.TFrame")
+        ring_wrap.pack(side="left", padx=(0, 18))
+        self.eye_ring = ProgressRing(ring_wrap, size=118, thickness=9, theme=self.theme_name())
+        self.eye_ring.pack()
+        self.eye_time_label = tk.Label(ring_wrap, text="20:00", font=("Segoe UI", 17, "bold"))
+        self.eye_time_label.place(relx=0.5, rely=0.42, anchor="center")
+        tk.Label(ring_wrap, text="remaining", font=("Segoe UI", 8)).place(
+            relx=0.5, rely=0.62, anchor="center")
+
+        eye_copy = ttk.Frame(eye_body, style="Card.TFrame")
+        eye_copy.pack(side="left", fill="both", expand=True)
+        ttk.Label(eye_copy, text="Next eye break", style="Card.TLabel",
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        ttk.Label(eye_copy, text="Every 20 minutes, look at something 20 feet away for "
+                                  "20 seconds — it gives your eyes a genuine chance to reset.",
+                  style="Muted.TLabel", wraplength=260, justify="left").pack(anchor="w", pady=(4, 0))
+
+        eye_btn_row = ttk.Frame(eye_card, style="Card.TFrame")
+        eye_btn_row.pack(fill="x", padx=16, pady=(6, 16))
+        self.btn_eye_toggle = ttk.Button(eye_btn_row, text="⏸  Pause reminders",
+                                          style="Outline.TButton", command=self._on_eye_toggle_button)
+        self.btn_eye_toggle.pack(side="left", padx=(0, 8))
+        ttk.Button(eye_btn_row, text="👀  Take a break now", style="Primary.TButton",
+                   command=lambda: self.action_queue.put("start_eye_break")).pack(side="left")
+        self.card0.finalize()
+
+        # -- Focus timer card: entirely optional, off unless you start it.
+        self.card1, timer_card, self.timer_strip = self._card(left_col, accent_strip=True)
+        focus_head = ttk.Frame(timer_card, style="Card.TFrame")
+        focus_head.pack(fill="x", padx=16, pady=(16, 0))
+        ttk.Label(focus_head, text="Focus Timer", style="Card.TLabel",
+                  font=("Segoe UI", 13, "bold")).pack(side="left")
+        tk.Label(focus_head, text="Optional", bg=t["border_soft"], fg=t["muted"],
+                 font=("Segoe UI", 8, "bold"), padx=6, pady=1).pack(side="left", padx=(8, 0))
+        self.state_badge = tk.Label(focus_head, text="Idle", font=("Segoe UI", 9, "bold"))
+        self.state_badge.pack(side="right")
+
+        ring_wrap2 = ttk.Frame(timer_card, style="Card.TFrame")
+        ring_wrap2.pack(pady=(10, 4))
+        self.ring = ProgressRing(ring_wrap2, size=204, thickness=13, theme=self.theme_name())
         self.ring.pack()
-        self.ring_time_label = tk.Label(ring_wrap, text="25:00", font=("Segoe UI", 32, "bold"))
+        self.ring_time_label = tk.Label(ring_wrap2, text="25:00", font=("Segoe UI", 30, "bold"))
         self.ring_time_label.place(relx=0.5, rely=0.42, anchor="center")
-        self.ring_state_label = tk.Label(ring_wrap, text="", font=("Segoe UI", 10))
+        self.ring_state_label = tk.Label(ring_wrap2, text="", font=("Segoe UI", 10))
         self.ring_state_label.place(relx=0.5, rely=0.58, anchor="center")
 
-        self.lbl_next_eye = ttk.Label(timer_card, text="Next eye break in: 20:00", style="Card.TLabel")
-        self.lbl_next_eye.pack(pady=(10, 4))
-        self.lbl_cycles = ttk.Label(timer_card, text="Focus sessions completed: 0", style="Card.TLabel")
-        self.lbl_cycles.pack(pady=(0, 12))
+        self.lbl_cycles = ttk.Label(timer_card, text="0 focus sessions completed", style="Card.TLabel")
+        self.lbl_cycles.pack(pady=(6, 10))
 
         btn_row = ttk.Frame(timer_card, style="Card.TFrame")
         btn_row.pack(pady=(0, 18))
-        self.btn_pause_resume = ttk.Button(btn_row, text="▶  Start", style="Primary.TButton",
+        self.btn_pause_resume = ttk.Button(btn_row, text="▶  Start focus session", style="Primary.TButton",
                                             command=lambda: self.action_queue.put("toggle_pause"))
         self.btn_pause_resume.grid(row=0, column=0, padx=4)
         self.btn_skip = ttk.Button(btn_row, text="⏭  Skip", style="Outline.TButton",
@@ -1104,72 +1315,239 @@ class Dashboard:
         self.btn_restart.grid(row=0, column=2, padx=4)
         self.card1.finalize()
 
-        # Stats card (today snapshot + link to full statistics page)
-        self.card2, stats_card, _ = self._card(self.body)
-        head = ttk.Frame(stats_card, style="Card.TFrame")
-        head.pack(fill="x", padx=14, pady=(12, 6))
-        ttk.Label(head, text="Today's statistics", style="Card.TLabel",
-                  font=("Segoe UI", 11, "bold")).pack(side="left")
-        ttk.Button(head, text="📊 Full stats", style="Outline.TButton",
-                   command=self._open_stats).pack(side="right")
+        # ===== RIGHT COLUMN =====
 
-        grid = ttk.Frame(stats_card, style="Card.TFrame")
-        grid.pack(fill="x", padx=14, pady=(0, 14))
+        # -- Today's progress: 2x2 icon stat tiles --
+        self.card2, stats_card, _ = self._card(right_col)
+        head = ttk.Frame(stats_card, style="Card.TFrame")
+        head.pack(fill="x", padx=14, pady=(14, 8))
+        ttk.Label(head, text="Today's progress", style="Card.TLabel",
+                  font=("Segoe UI", 12, "bold")).pack(side="left")
+
+        tiles = ttk.Frame(stats_card, style="Card.TFrame")
+        tiles.pack(fill="x", padx=14)
+        tiles.columnconfigure(0, weight=1, uniform="tile")
+        tiles.columnconfigure(1, weight=1, uniform="tile")
+
         self.stat_labels = {}
-        for i, (key, label) in enumerate([("screen", "Screen time"), ("focus", "Focus time"),
-                                           ("breaks", "Break time"), ("eye", "Eye breaks")]):
-            col = ttk.Frame(grid, style="Card.TFrame")
-            col.grid(row=0, column=i, padx=6, sticky="w")
-            num = ttk.Label(col, text="—", style="StatNum.TLabel")
-            num.pack(anchor="w")
-            ttk.Label(col, text=label, style="StatLbl.TLabel").pack(anchor="w")
+        self.stat_bars = {}
+        tile_defs = [
+            ("screen", "Screen time", "🖥", "green"),
+            ("focus", "Focus time", "⏱", "indigo"),
+            ("breaks", "Break time", "☕", "amber"),
+            ("eye", "Eye breaks", "👁", "gray"),
+        ]
+        for i, (key, label, icon, colorkind) in enumerate(tile_defs):
+            r, c = divmod(i, 2)
+            tile_outer = tk.Frame(tiles, bg=t["border_soft"])
+            tile_outer.grid(row=r, column=c, sticky="nsew", padx=4, pady=4)
+            tile = tk.Frame(tile_outer, bg=t["card"])
+            tile.pack(fill="both", expand=True, padx=1, pady=1)
+            icon_bg, icon_fg = self._tile_colors(colorkind)
+            icon_lbl = tk.Label(tile, text=icon, bg=icon_bg, fg=icon_fg,
+                                 font=("Segoe UI", 10), width=2, height=1)
+            icon_lbl.pack(anchor="w", padx=10, pady=(10, 6))
+            num = tk.Label(tile, text="—", bg=t["card"], fg=t["text"], font=("Segoe UI", 15, "bold"))
+            num.pack(anchor="w", padx=10)
+            tk.Label(tile, text=label, bg=t["card"], fg=t["muted"], font=("Segoe UI", 8)).pack(
+                anchor="w", padx=10, pady=(0, 8))
+            bar_bg = tk.Frame(tile, bg=t["border_soft"], height=4)
+            bar_bg.pack(fill="x", padx=10, pady=(0, 10))
+            bar_fill = tk.Frame(bar_bg, bg=icon_fg, height=4, width=0)
+            bar_fill.place(x=0, y=0, relheight=1)
             self.stat_labels[key] = num
+            self.stat_bars[key] = (bar_bg, bar_fill, icon_fg)
+
+        view_stats = tk.Label(stats_card, text="View full statistics  →", bg=t["card"],
+                               fg=self.settings.get("accent_color", "#3FA34D"),
+                               font=("Segoe UI", 9, "bold"), cursor="hand2")
+        view_stats.pack(anchor="w", padx=14, pady=(8, 14))
+        view_stats.bind("<Button-1>", lambda e: self._open_stats())
         self.card2.finalize()
 
-        # Quick settings card
-        self.card3, quick_card, _ = self._card(self.body)
+        # -- Wellness score --
+        self.card_wellness, wellness_card, _ = self._card(right_col)
+        ttk.Label(wellness_card, text="Today's wellness", style="Card.TLabel",
+                  font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=14, pady=(14, 8))
+
+        wbody = ttk.Frame(wellness_card, style="Card.TFrame")
+        wbody.pack(fill="x", padx=14)
+        wring_wrap = ttk.Frame(wbody, style="Card.TFrame")
+        wring_wrap.pack(side="left", padx=(0, 14))
+        self.wellness_ring = ProgressRing(wring_wrap, size=78, thickness=7, theme=self.theme_name())
+        self.wellness_ring.pack()
+        self.wellness_score_label = tk.Label(wring_wrap, text="—", font=("Segoe UI", 15, "bold"))
+        self.wellness_score_label.place(relx=0.5, rely=0.42, anchor="center")
+        tk.Label(wring_wrap, text="/ 100", font=("Segoe UI", 7)).place(
+            relx=0.5, rely=0.63, anchor="center")
+
+        wcopy = ttk.Frame(wbody, style="Card.TFrame")
+        wcopy.pack(side="left", fill="both", expand=True)
+        self.wellness_label_top = ttk.Label(wcopy, text="—", style="Card.TLabel",
+                                             font=("Segoe UI", 10, "bold"))
+        self.wellness_label_top.pack(anchor="w")
+        self.wellness_tip_label = ttk.Label(wcopy, text="", style="Muted.TLabel",
+                                             wraplength=220, justify="left")
+        self.wellness_tip_label.pack(anchor="w", pady=(3, 0))
+
+        self.wellness_indicators = ttk.Frame(wellness_card, style="Card.TFrame")
+        self.wellness_indicators.pack(fill="x", padx=14, pady=(12, 14))
+        self.wellness_rows = {}
+        for key, label, colorkind in [("eye", "Eye breaks", "green"),
+                                       ("focus", "Focus sessions", "indigo"),
+                                       ("screen", "Screen time", "amber")]:
+            row = ttk.Frame(self.wellness_indicators, style="Card.TFrame")
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=label, bg=t["card"], fg=t["muted"], font=("Segoe UI", 9),
+                     width=13, anchor="w").pack(side="left")
+            bar_bg = tk.Frame(row, bg=t["border_soft"], height=6)
+            bar_bg.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            _, fg = self._tile_colors(colorkind)
+            bar_fill = tk.Frame(bar_bg, bg=fg, height=6, width=0)
+            bar_fill.place(x=0, y=0, relheight=1)
+            val_lbl = tk.Label(row, text="—", bg=t["card"], fg=t["text"], font=("Segoe UI", 9, "bold"))
+            val_lbl.pack(side="right")
+            self.wellness_rows[key] = (bar_bg, bar_fill, val_lbl, fg)
+        self.card_wellness.finalize()
+
+        # -- Quick settings --
+        self.card3, quick_card, _ = self._card(right_col)
         ttk.Label(quick_card, text="Quick settings", style="Card.TLabel",
-                  font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=14, pady=(12, 6))
-        qc = ttk.Frame(quick_card, style="Card.TFrame")
-        qc.pack(fill="x", padx=14, pady=(0, 14))
+                  font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=14, pady=(14, 4))
 
-        self.eye_enabled_var = tk.BooleanVar(value=self.settings.get("eye_rule_enabled", True))
-        ttk.Checkbutton(qc, text="👀 20-20-20 reminders", variable=self.eye_enabled_var,
-                         command=lambda: self._quick_set("eye_rule_enabled", self.eye_enabled_var)
-                         ).grid(row=0, column=0, sticky="w", pady=3)
+        self.switches = {}
 
-        self.notif_enabled_var = tk.BooleanVar(value=self.settings.get("notifications_enabled", True))
-        ttk.Checkbutton(qc, text="🔔 Notifications", variable=self.notif_enabled_var,
-                         command=lambda: self._quick_set("notifications_enabled", self.notif_enabled_var)
-                         ).grid(row=1, column=0, sticky="w", pady=3)
+        def switch_row(parent, label, key, initial, on_change):
+            row = ttk.Frame(parent, style="Card.TFrame")
+            row.pack(fill="x", padx=14, pady=7)
+            tk.Label(row, text=label, bg=t["card"], fg=t["text"], font=("Segoe UI", 10)).pack(side="left")
+            sw = Switch(row, bg=t["card"], on_color=self.settings.get("accent_color", "#3FA34D"),
+                        off_color=t["border"], value=initial, command=on_change)
+            sw.pack(side="right")
+            self.switches[key] = sw
+            return sw
 
-        self.sound_var = tk.BooleanVar(value=self.settings.get("sound_enabled", True))
-        ttk.Checkbutton(qc, text="🔊 Sound", variable=self.sound_var,
-                         command=lambda: self._quick_set("sound_enabled", self.sound_var)
-                         ).grid(row=0, column=1, sticky="w", padx=(20, 0), pady=3)
+        switch_row(quick_card, "Eye break reminders", "eye",
+                   self.settings.get("eye_rule_enabled", True), self._on_eye_switch)
+        switch_row(quick_card, "Focus timer running", "focus",
+                   self.engine.running, self._on_focus_switch)
+        switch_row(quick_card, "Sound", "sound",
+                   self.settings.get("sound_enabled", True),
+                   lambda v: self._quick_set_value("sound_enabled", v))
+        switch_row(quick_card, "Start with Windows", "startup",
+                   self.settings.get("start_with_windows", False), self._on_startup_switch)
 
-        self.dark_var = tk.BooleanVar(value=self.settings.get("theme", "light") == "dark")
-        ttk.Checkbutton(qc, text="🌙 Dark theme", variable=self.dark_var,
-                         command=self._on_theme_toggle).grid(row=1, column=1, sticky="w", padx=(20, 0), pady=3)
+        tk.Frame(quick_card, bg=t["border_soft"], height=1).pack(fill="x", padx=14, pady=(6, 10))
+
+        def dropdown_row(parent, label, key, options, current, on_change):
+            row = ttk.Frame(parent, style="Card.TFrame")
+            row.pack(fill="x", padx=14, pady=6)
+            tk.Label(row, text=label, bg=t["card"], fg=t["text"], font=("Segoe UI", 10)).pack(side="left")
+            var = tk.StringVar(value=current)
+            combo = ttk.Combobox(row, textvariable=var, values=options, width=8,
+                                  state="readonly", font=("Segoe UI", 9))
+            combo.pack(side="right")
+            combo.bind("<<ComboboxSelected>>", lambda e: on_change(var.get()))
+            return var
+
+        dropdown_row(quick_card, "Eye break interval", "eye_interval",
+                     ["15 min", "20 min", "25 min", "30 min"],
+                     f"{self.settings['rule_interval_minutes']} min", self._on_eye_interval_change)
+        dropdown_row(quick_card, "Break duration", "look_duration",
+                     ["15 sec", "20 sec", "30 sec"],
+                     f"{self.settings['rule_look_seconds']} sec", self._on_look_duration_change)
+        dropdown_row(quick_card, "Focus duration", "focus_duration",
+                     ["15 min", "25 min", "30 min", "50 min"],
+                     f"{self.settings['work_minutes']} min", self._on_focus_duration_change)
         self.card3.finalize()
 
-        bottom = ttk.Frame(self.body)
-        bottom.pack(fill="x", padx=20, pady=(6, 18))
-        ttk.Button(bottom, text="⚙  All Settings", style="Outline.TButton",
-                   command=self._open_full_settings).pack(side="left")
-        hint = "Closing this window minimizes to tray." if HAS_TRAY else \
-               "(tray icon needs: pip install pystray pillow)"
-        ttk.Label(bottom, text=hint, style="Sub.TLabel").pack(side="right")
+        bottom = tk.Frame(right_col, bg=t["bg"])
+        bottom.pack(fill="x", pady=(2, 0))
+        hint = "" if HAS_TRAY else "Tray icon needs: pip install pystray pillow"
+        if hint:
+            tk.Label(ring_wrap, text="remaining", font=("Segoe UI", 8)).place(
+    relx=0.5, rely=0.62, anchor="center")
 
-    # -- toggle handlers ------------------------------------------------------
+    def _draw_logo(self, canvas, accent):
+        canvas.delete("all")
+        canvas.create_oval(1, 1, 33, 33, fill=accent, outline=accent)
+        canvas.create_line(17, 9, 17, 25, fill="white", width=2, capstyle="round")
+        canvas.create_arc(6, 6, 28, 28, start=200, extent=140, style="arc", outline="white", width=2)
 
-    def _quick_set(self, key, var):
-        self.settings[key] = var.get()
+    def _tile_colors(self, kind):
+        t = self.theme_name()
+        if kind == "green":
+            return (self.theme()["border_soft"], self.settings.get("accent_color", "#3FA34D"))
+        if kind == "indigo":
+            return (INDIGO_WASH[t], INDIGO)
+        if kind == "amber":
+            return (AMBER_WASH[t], AMBER)
+        return (self.theme()["border_soft"], self.theme()["muted"])
+
+    # -- toggle / settings handlers --------------------------------------------
+
+    def _quick_set_value(self, key, value):
+        self.settings[key] = value
         self._persist()
 
-    def _on_theme_toggle(self):
-        self.settings["theme"] = "dark" if self.dark_var.get() else "light"
+    def _on_eye_switch(self, enabled):
+        self.settings["eye_rule_enabled"] = enabled
+        if enabled:
+            self.engine.start_eye()
+        else:
+            self.engine.pause_eye()
+        self._persist()
+        self._refresh()
+
+    def _on_focus_switch(self, running):
+        if running:
+            if self.engine.state == "idle":
+                self.engine.start()
+            elif not self.engine.running:
+                self.engine.resume()
+        else:
+            if self.engine.running:
+                self.engine.pause()
+        self._persist()
+        self._refresh()
+
+    def _on_startup_switch(self, enabled):
+        self.settings["start_with_windows"] = enabled
+        set_start_with_windows(enabled)
+        self._persist()
+
+    def _on_eye_toggle_button(self):
+        if self.engine.eye_running:
+            self.engine.pause_eye()
+            self.settings["eye_rule_enabled"] = False
+        else:
+            self.engine.start_eye()
+            self.settings["eye_rule_enabled"] = True
+        if "eye" in getattr(self, "switches", {}):
+            self.switches["eye"].set(self.settings["eye_rule_enabled"])
+        self._persist()
+        self._refresh()
+
+    def _on_theme_toggle_icon(self):
+        current = self.settings.get("theme", "light")
+        # cycle light -> dark -> light (system is chosen explicitly in Settings)
+        self.settings["theme"] = "light" if current == "dark" else "dark"
         self._apply_theme()
+        self._persist()
+
+    def _on_eye_interval_change(self, value):
+        minutes = int(value.split()[0])
+        self.settings["rule_interval_minutes"] = minutes
+        self._persist()
+
+    def _on_look_duration_change(self, value):
+        seconds = int(value.split()[0])
+        self.settings["rule_look_seconds"] = seconds
+        self._persist()
+
+    def _on_focus_duration_change(self, value):
+        minutes = int(value.split()[0])
+        self.settings["work_minutes"] = minutes
         self._persist()
 
     def _open_full_settings(self):
@@ -1179,6 +1557,16 @@ class Dashboard:
         StatisticsWindow(self.root, self.engine, self.history, self.theme(), self.theme_name())
 
     def _on_settings_saved(self):
+        # Keep the live eye-tracking state in sync with whatever the
+        # Settings window's "Enable 20-20-20 reminders" checkbox ended up
+        # set to, since that's independent of the Pomodoro timer.
+        wants_eye = self.settings.get("eye_rule_enabled", True)
+        if wants_eye and not self.engine.eye_running:
+            self.engine.start_eye()
+        elif not wants_eye and self.engine.eye_running:
+            self.engine.pause_eye()
+        if "eye" in getattr(self, "switches", {}):
+            self.switches["eye"].set(wants_eye)
         self._apply_theme()
         self._persist()
         self._refresh()
@@ -1228,6 +1616,15 @@ class Dashboard:
             self.engine.restart()
         elif action == "start_eye_break":
             self.engine.trigger_eye_break_now()
+        elif action == "toggle_eye":
+            if self.engine.eye_running:
+                self.engine.pause_eye()
+                self.settings["eye_rule_enabled"] = False
+            else:
+                self.engine.start_eye()
+                self.settings["eye_rule_enabled"] = True
+            if hasattr(self, "eye_enabled_var"):
+                self.eye_enabled_var.set(self.settings["eye_rule_enabled"])
         elif action in ("start_eye_break_go",):
             self.show()
         elif action == "open_dashboard":
@@ -1387,35 +1784,123 @@ class Dashboard:
         disp = self.engine.display_state()
         meta = meta_all[disp]
 
-        self.state_badge.config(text=f"{meta['emoji']}  {meta['label']}",
-                                 bg=meta["light"], fg=meta["color"], padx=14, pady=6,
-                                 font=("Segoe UI", 12, "bold"))
+        idle_with_eyes_on = disp == "idle" and self.engine.eye_running
+        badge_text = f"{meta['emoji']}  {meta['label']}"
+        if idle_with_eyes_on:
+            badge_text += "  ·  👀 eye breaks on"
+        if hasattr(self, "state_badge"):
+            self.state_badge.config(text=badge_text,
+                                     bg=meta["light"], fg=meta["color"], padx=10, pady=4,
+                                     font=("Segoe UI", 9, "bold"))
         if getattr(self, "timer_strip", None) is not None:
             self.timer_strip.configure(bg=meta["color"])
-        self.ring_time_label.config(text=fmt_mmss(self.engine.remaining), bg=t["card"], fg=t["text"])
-        self.ring_state_label.config(text=meta["label"], bg=t["card"], fg=meta["color"])
+        if hasattr(self, "ring_time_label"):
+            self.ring_time_label.config(text=fmt_mmss(self.engine.remaining), bg=t["card"], fg=t["text"])
+            self.ring_state_label.config(text=meta["label"], bg=t["card"], fg=meta["color"])
 
         if self.engine.phase_total > 0:
             frac = max(0.0, min(1.0, (self.engine.phase_total - self.engine.remaining) / self.engine.phase_total))
         else:
             frac = 0.0
-        self.ring.set_progress(frac, meta["color"])
+        if hasattr(self, "ring"):
+            self.ring.set_progress(frac, meta["color"])
 
-        eye_remaining = self.engine.eye_remaining
-        eye_suffix = "" if self.settings.get("eye_rule_enabled", True) else " (disabled)"
-        self.lbl_next_eye.config(text=f"Next eye break in: {fmt_mmss(eye_remaining)}{eye_suffix}")
-        self.lbl_cycles.config(text=f"Focus sessions completed: {self.engine.cycle_count}")
+        eye_meta = BASE_STATE_META["eye_break"]
+        eye_total = self.settings["rule_interval_minutes"] * 60
+        eye_frac = 1 - max(0.0, min(1.0, self.engine.eye_remaining / eye_total)) if eye_total else 0.0
+        if hasattr(self, "eye_ring"):
+            self.eye_ring.set_progress(eye_frac, eye_meta["color"] if self.engine.eye_running else t["muted"])
+        if hasattr(self, "eye_time_label"):
+            self.eye_time_label.config(
+                text=fmt_mmss(self.engine.eye_remaining) if self.engine.eye_running else "--:--",
+                bg=t["card"], fg=t["text"])
+        if hasattr(self, "eye_status_badge"):
+            if self.engine.eye_running:
+                self.eye_status_badge.config(text="Active", bg=eye_meta["light"], fg=eye_meta["color"],
+                                              padx=8, pady=2)
+                self.btn_eye_toggle.config(text="⏸  Pause reminders")
+            else:
+                self.eye_status_badge.config(text="Paused", bg=t["border_soft"], fg=t["muted"],
+                                              padx=8, pady=2)
+                self.btn_eye_toggle.config(text="▶  Resume reminders")
+        if "eye" in getattr(self, "switches", {}):
+            self.switches["eye"].set(self.engine.eye_running)
+        if "focus" in getattr(self, "switches", {}):
+            self.switches["focus"].set(self.engine.running)
 
-        self.btn_pause_resume.config(
-            text=("⏸  Pause" if self.engine.running else
-                  ("▶  Resume" if self.engine.state != "idle" else "▶  Start")))
+        if hasattr(self, "lbl_cycles"):
+            self.lbl_cycles.config(text=f"{self.engine.cycle_count} focus sessions completed")
+        if hasattr(self, "btn_pause_resume"):
+            self.btn_pause_resume.config(
+                text=("⏸  Pause" if self.engine.running else
+                      ("▶  Resume" if self.engine.state != "idle" else "▶  Start focus session")))
 
-        self.stat_labels["screen"].config(text=fmt_hms(self.engine.today_screen_seconds))
-        self.stat_labels["focus"].config(text=fmt_hms(self.engine.today_focus_seconds))
-        self.stat_labels["breaks"].config(text=fmt_hms(self.engine.today_break_seconds))
-        self.stat_labels["eye"].config(text=str(self.engine.eye_completed))
+        if hasattr(self, "stat_labels"):
+            self.stat_labels["screen"].config(text=fmt_hms(self.engine.today_screen_seconds))
+            self.stat_labels["focus"].config(text=fmt_hms(self.engine.today_focus_seconds))
+            self.stat_labels["breaks"].config(text=fmt_hms(self.engine.today_break_seconds))
+            self.stat_labels["eye"].config(text=str(self.engine.eye_completed))
+
+        if hasattr(self, "stat_bars"):
+            # Rough daily "goal" references just to give the tiles a sense
+            # of scale — purely visual, not a hard target.
+            goals = {"screen": 8 * 3600, "focus": 4 * 3600, "breaks": 3600, "eye": 12}
+            values = {"screen": self.engine.today_screen_seconds, "focus": self.engine.today_focus_seconds,
+                      "breaks": self.engine.today_break_seconds, "eye": self.engine.eye_completed}
+            for key, (bar_bg, bar_fill, color) in self.stat_bars.items():
+                pct_val = max(0.0, min(1.0, values[key] / goals[key])) if goals[key] else 0.0
+                bar_bg.update_idletasks()
+                w = max(1, bar_bg.winfo_width())
+                bar_fill.place(width=max(2, int(w * pct_val)))
+
+        if hasattr(self, "wellness_score_label"):
+            wb = self.engine.wellbeing()
+            self.wellness_ring.set_progress(wb["score"] / 100, INDIGO)
+            self.wellness_score_label.config(text=str(wb["score"]), bg=t["card"], fg=t["text"])
+            self.wellness_label_top.config(text=wb["label"])
+            self.wellness_tip_label.config(text=wb["tip"])
+            key_map = {"👀": "eye", "🧘": "focus", "⏱": "focus", "🌿": "screen"}
+            # map the four wellbeing rows onto the three summary indicators
+            lookup = {label: value for _emoji, label, value in wb["breakdown"]}
+            row_values = {
+                "eye": lookup.get("Eye breaks", 0),
+                "focus": lookup.get("Focus sessions", 0),
+                "screen": round((lookup.get("Short breaks", 0) + lookup.get("Long breaks", 0)) / 2),
+            }
+            for key, (bar_bg, bar_fill, val_lbl, color) in self.wellness_rows.items():
+                pct_val = max(0, min(100, row_values.get(key, 0)))
+                bar_bg.update_idletasks()
+                w = max(1, bar_bg.winfo_width())
+                bar_fill.place(width=max(2, int(w * pct_val / 100)))
+                val_lbl.config(text=f"{pct_val}%", bg=t["card"], fg=t["text"])
+
+        if hasattr(self, "streak_pill"):
+            streak = self._compute_streak()
+            plural = "" if streak == 1 else "s"
+            self.streak_pill.config(text=f"🔥 {streak} day{plural} streak")
 
         self.tray.refresh()
+
+    def _compute_streak(self):
+        """Consecutive days (including today, if there's been any activity
+        yet) with at least one completed eye break or focus session."""
+        def was_active(stats):
+            return (stats.get("eye_completed", 0) + stats.get("focus_completed", 0)
+                    + stats.get("short_completed", 0) + stats.get("long_completed", 0)) > 0
+
+        streak = 0
+        d = date.today()
+        if was_active(self.engine.stats_snapshot()):
+            streak = 1
+        d -= timedelta(days=1)
+        while True:
+            stats = self.history.get(str(d))
+            if stats and was_active(stats):
+                streak += 1
+                d -= timedelta(days=1)
+            else:
+                break
+        return streak
 
     def _persist(self):
         save_data({
@@ -1442,7 +1927,7 @@ class CornerToast:
             pass
         self.win.configure(bg=theme["card"])
 
-        accent = settings.get("accent_color", "#43a047")
+        accent = settings.get("accent_color", "#3FA34D")
         # Gentle: small, quiet, brief. Strict: a little larger, bolder
         # border, stays up longer — still just a corner toast, never
         # blocking the screen.
@@ -1714,6 +2199,7 @@ class EyeBreakWindow:
         self.settings = settings
         self.on_finish = on_finish
         self.seconds_total = settings["rule_look_seconds"]
+        self.deadline = time.time() + self.seconds_total
         self.seconds_left = self.seconds_total
         self._pulse = 0.0
         self._pulse_grow = True
@@ -1784,12 +2270,12 @@ class EyeBreakWindow:
     def _countdown(self):
         if not self.win.winfo_exists():
             return
+        self.seconds_left = max(0, round(self.deadline - time.time()))
         if self.seconds_left <= 0:
             self._done_naturally = True
             self._show_confirmation()
             return
-        self.seconds_left -= 1
-        self.win.after(1000, self._countdown)
+        self.win.after(200, self._countdown)
 
     def _show_confirmation(self):
         play_chime("confirm", self.settings.get("eye_sound_enabled", True))
@@ -1927,7 +2413,7 @@ class StatisticsWindow:
         days, minutes = self._last_7_days_focus_minutes()
         chart = BarChart(chart_card.inner, width=430, height=150, theme=theme_name)
         chart.pack(padx=8, pady=8)
-        chart.draw(days, minutes, "#43a047", unit="m")
+        chart.draw(days, minutes, "#3FA34D", unit="m")
         chart_card.finalize()
 
         tk.Label(frame, text="", bg=theme["bg"]).pack(pady=10)  # bottom spacer
@@ -1968,7 +2454,7 @@ class SettingsWindow:
             style.theme_use("clam")
         except Exception:
             pass
-        accent = settings.get("accent_color", "#43a047")
+        accent = settings.get("accent_color", "#3FA34D")
         style.configure("TNotebook", background=theme["bg"], borderwidth=0, tabmargins=(6, 8, 6, 0))
         style.configure("TNotebook.Tab", background=theme["border"], foreground=theme["text"],
                          font=("Segoe UI", 9, "bold"), padding=(12, 6), borderwidth=0)
@@ -1990,7 +2476,7 @@ class SettingsWindow:
 
         btn_frame = tk.Frame(self.win, bg=theme["bg"])
         btn_frame.pack(side="bottom", fill="x", pady=8)
-        tk.Button(btn_frame, text="Save", command=self._save, bg=self.settings.get("accent_color", "#43a047"),
+        tk.Button(btn_frame, text="Save", command=self._save, bg=self.settings.get("accent_color", "#3FA34D"),
                   fg="white", font=("Segoe UI", 10, "bold"), relief="flat", padx=18, pady=8).pack()
 
     # -- helpers --------------------------------------------------------------
@@ -2114,14 +2600,14 @@ class SettingsWindow:
         row.pack(fill="x", padx=10, pady=10)
         tk.Label(row, text="Accent color", bg=self.theme["bg"], fg=self.theme["muted"],
                  font=("Segoe UI", 9)).pack(side="left")
-        self.accent_preview = tk.Label(row, text="   ", bg=self.settings.get("accent_color", "#43a047"))
+        self.accent_preview = tk.Label(row, text="   ", bg=self.settings.get("accent_color", "#3FA34D"))
         self.accent_preview.pack(side="right", padx=(6, 0))
         tk.Button(row, text="Choose…", command=self._pick_accent, relief="flat",
                   bg=self.theme["border"], fg=self.theme["text"], font=("Segoe UI", 8, "bold"),
                   padx=8, pady=3).pack(side="right")
 
     def _pick_accent(self):
-        color = colorchooser.askcolor(color=self.settings.get("accent_color", "#43a047"))
+        color = colorchooser.askcolor(color=self.settings.get("accent_color", "#3FA34D"))
         if color and color[1]:
             self.settings["accent_color"] = color[1]
             self.accent_preview.configure(bg=color[1])
@@ -2191,6 +2677,10 @@ class SettingsWindow:
         self.on_save()
 
 
+# ---------------------------------------------------------------------------
+# App bootstrap
+# ---------------------------------------------------------------------------
+
 def main():
     stored = load_data()
     settings = dict(DEFAULTS)
@@ -2214,6 +2704,8 @@ def main():
 
     engine = TimerEngine(settings, on_event)
     engine.reset_all(persisted=persisted_stats)
+    if stored.get("last_date") == today:
+        engine.restore(stored.get("engine_state"))
 
     notifier = NotificationManager(settings, action_queue)
     tray = TrayManager(engine, action_queue, settings)

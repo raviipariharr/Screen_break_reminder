@@ -27,19 +27,19 @@
     "custom_presets": {},
     "_prev_start_with_windows": false
   },
-  "last_date": "2026-09-06",
+  "last_date": "2026-09-08",
   "stats": {
-    "today_focus_seconds": 3859,
-    "today_break_seconds": 335,
-    "today_screen_seconds": 4194,
-    "eye_completed": 3,
+    "today_focus_seconds": 0,
+    "today_break_seconds": 0,
+    "today_screen_seconds": 101.14807105064392,
+    "eye_completed": 0,
     "eye_skipped": 0,
-    "short_completed": 1,
-    "short_skipped": 2,
+    "short_completed": 0,
+    "short_skipped": 0,
     "long_completed": 0,
     "long_skipped": 0,
-    "focus_completed": 3,
-    "focus_skipped": 2
+    "focus_completed": 0,
+    "focus_skipped": 0
   },
   "history": {
     "2026-09-04": {
@@ -60,6 +60,47 @@
       "long_skipped": 0,
       "focus_completed": 0,
       "focus_skipped": 1
+    },
+    "2026-09-06": {
+      "today_focus_seconds": 13018,
+      "today_break_seconds": 3045,
+      "today_screen_seconds": 16099.253448963165,
+      "eye_completed": 12,
+      "eye_skipped": 1,
+      "short_completed": 7,
+      "short_skipped": 2,
+      "long_completed": 1,
+      "long_skipped": 1,
+      "focus_completed": 0,
+      "focus_skipped": 2
+    },
+    "2026-09-08": {
+      "today_focus_seconds": 0,
+      "today_break_seconds": 0,
+      "today_screen_seconds": 99.9570701122284,
+      "eye_completed": 0,
+      "eye_skipped": 0,
+      "short_completed": 0,
+      "short_skipped": 0,
+      "long_completed": 0,
+      "long_skipped": 0,
+      "focus_completed": 0,
+      "focus_skipped": 0
     }
+  },
+  "engine_state": {
+    "state": "idle",
+    "running": false,
+    "phase_end": null,
+    "phase_total": 1200,
+    "paused_phase_remaining": null,
+    "eye_running": true,
+    "eye_end": 1788848523.5198946,
+    "eye_total": 1200,
+    "paused_eye_remaining": null,
+    "cycle_count": 0,
+    "warned_break": false,
+    "warned_eye": false,
+    "saved_at": 1788847424.67557
   }
 }
